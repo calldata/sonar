@@ -1,3 +1,10 @@
+// Enforce the stdout/stderr contract (docs/output-conventions.md): outside of
+// tests, all terminal output must route through `output::stream` (the `outln!`/
+// `errln!` macros), so a stray `println!`/`eprintln!` in a handler is a compile
+// error rather than a silently corrupted stdout stream. Test code may print
+// freely for debugging.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 mod cli;
 mod converters;
 mod core;
@@ -12,11 +19,13 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Commands};
 
+use crate::output::stream::errln;
+
 fn main() {
     if let Err(err) = run() {
         // Use alternate Display format ({:#}) for user-friendly single-line error chain
         // instead of Debug format ({:?}) which outputs the full anyhow backtrace
-        eprintln!("Error: {err:#}");
+        errln!("Error: {err:#}");
         std::process::exit(1);
     }
 }

@@ -32,6 +32,72 @@ pub struct TokenBalanceChange {
     pub decimals: u8,
 }
 
+impl SolBalanceChange {
+    /// Build a SOL balance change from before/after lamports, or `None` when the
+    /// balance is unchanged. This is the single definition of the SOL delta rule,
+    /// used both when diffing simulated account snapshots and when reading a
+    /// replayed transaction's balances from RPC metadata.
+    pub fn from_balances(account: Pubkey, before: u64, after: u64) -> Option<Self> {
+        if before == after {
+            return None;
+        }
+        Some(Self { account, before, after, change: after as i128 - before as i128 })
+    }
+}
+
+impl TokenBalanceChange {
+    /// Build a token balance change from before/after raw amounts, or `None` when
+    /// the amount is unchanged. The single definition of the token delta rule,
+    /// shared by simulation and replay.
+    pub fn from_balances(
+        account: Pubkey,
+        owner: Pubkey,
+        mint: Pubkey,
+        before: u64,
+        after: u64,
+        decimals: u8,
+    ) -> Option<Self> {
+        if before == after {
+            return None;
+        }
+        Some(Self {
+            account,
+            owner,
+            mint,
+            before,
+            after,
+            change: after as i128 - before as i128,
+            decimals,
+        })
+    }
+}
+
+/// A balance change with a signed magnitude, letting SOL and token changes share
+/// one ordering policy.
+pub trait BalanceChange {
+    /// The signed change amount; ordering uses its absolute value.
+    fn change_amount(&self) -> i128;
+}
+
+impl BalanceChange for SolBalanceChange {
+    fn change_amount(&self) -> i128 {
+        self.change
+    }
+}
+
+impl BalanceChange for TokenBalanceChange {
+    fn change_amount(&self) -> i128 {
+        self.change
+    }
+}
+
+/// Sort balance changes by descending magnitude — the shared ordering used for
+/// both simulated and replayed transactions, so identical transactions render
+/// their balance changes in the same order regardless of the data source.
+pub fn sort_by_magnitude<T: BalanceChange>(changes: &mut [T]) {
+    changes.sort_by_key(|c| std::cmp::Reverse(c.change_amount().abs()));
+}
+
 /// Compute SOL balance changes between pre and post account states.
 ///
 /// Only accounts with actual balance changes (change != 0) are included.
@@ -44,29 +110,17 @@ pub fn compute_sol_changes(
     for (pubkey, post_account) in post_accounts {
         let after = post_account.lamports();
         let before = pre_accounts.get(pubkey).map(|acc| acc.lamports()).unwrap_or(0);
-
-        let change = after as i128 - before as i128;
-        if change != 0 {
-            changes.push(SolBalanceChange { account: *pubkey, before, after, change });
-        }
+        changes.extend(SolBalanceChange::from_balances(*pubkey, before, after));
     }
 
     // Accounts that existed before but are missing after (closed/reclaimed)
     for (pubkey, pre_account) in pre_accounts {
         if !post_accounts.contains_key(pubkey) {
-            let before = pre_account.lamports();
-            if before != 0 {
-                changes.push(SolBalanceChange {
-                    account: *pubkey,
-                    before,
-                    after: 0,
-                    change: -(before as i128),
-                });
-            }
+            changes.extend(SolBalanceChange::from_balances(*pubkey, pre_account.lamports(), 0));
         }
     }
 
-    changes.sort_by_key(|change| std::cmp::Reverse(change.change.abs()));
+    sort_by_magnitude(&mut changes);
     changes
 }
 
@@ -92,19 +146,15 @@ pub fn compute_token_changes(
                 .map(|d| d.amount)
                 .unwrap_or(0);
 
-            let change = decoded.amount as i128 - before_amount as i128;
-            if change != 0 {
-                let decimals = mint_decimals.get(&decoded.mint).copied().unwrap_or(0);
-                changes.push(TokenBalanceChange {
-                    account: *pubkey,
-                    owner: decoded.owner,
-                    mint: decoded.mint,
-                    before: before_amount,
-                    after: decoded.amount,
-                    change,
-                    decimals,
-                });
-            }
+            let decimals = mint_decimals.get(&decoded.mint).copied().unwrap_or(0);
+            changes.extend(TokenBalanceChange::from_balances(
+                *pubkey,
+                decoded.owner,
+                decoded.mint,
+                before_amount,
+                decoded.amount,
+                decimals,
+            ));
         }
     }
 
@@ -114,23 +164,20 @@ pub fn compute_token_changes(
             if let Some(decoded) =
                 token_decode::try_decode_token_account(pre_account.data(), pre_account.owner())
             {
-                if decoded.amount != 0 {
-                    let decimals = mint_decimals.get(&decoded.mint).copied().unwrap_or(0);
-                    changes.push(TokenBalanceChange {
-                        account: *pubkey,
-                        owner: decoded.owner,
-                        mint: decoded.mint,
-                        before: decoded.amount,
-                        after: 0,
-                        change: -(decoded.amount as i128),
-                        decimals,
-                    });
-                }
+                let decimals = mint_decimals.get(&decoded.mint).copied().unwrap_or(0);
+                changes.extend(TokenBalanceChange::from_balances(
+                    *pubkey,
+                    decoded.owner,
+                    decoded.mint,
+                    decoded.amount,
+                    0,
+                    decimals,
+                ));
             }
         }
     }
 
-    changes.sort_by_key(|change| std::cmp::Reverse(change.change.abs()));
+    sort_by_magnitude(&mut changes);
     changes
 }
 

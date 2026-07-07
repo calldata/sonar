@@ -1,4 +1,6 @@
 use anyhow::Result;
+
+use crate::output::stream::outln;
 use clap::ValueEnum;
 
 use crate::cli::{ConvertArgs, ConvertOutputFormat};
@@ -44,7 +46,7 @@ pub(crate) fn handle(mut args: ConvertArgs, json: bool) -> Result<()> {
             to: to_name,
         })?;
     } else {
-        println!("{}", output);
+        outln!("{}", output);
     }
     Ok(())
 }

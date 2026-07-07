@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::output::stream::{errln, outln};
+
 use anyhow::{Context, Result};
 use colored::Colorize;
 use serde::Serialize;
@@ -92,9 +94,9 @@ fn handle_list(json: bool) -> Result<()> {
     let cache_root = cache::resolve_cache_dir(&None);
     if !cache_root.exists() {
         if json {
-            println!("[]");
+            outln!("[]");
         } else {
-            eprintln!("No cache directory found at {}", cache_root.display());
+            errln!("No cache directory found at {}", cache_root.display());
         }
         return Ok(());
     }
@@ -103,9 +105,9 @@ fn handle_list(json: bool) -> Result<()> {
 
     if entries.is_empty() {
         if json {
-            println!("[]");
+            outln!("[]");
         } else {
-            eprintln!("Cache is empty");
+            errln!("Cache is empty");
         }
         return Ok(());
     }
@@ -141,7 +143,7 @@ fn handle_list(json: bool) -> Result<()> {
             .collect();
         crate::output::print_json(&list)?;
     } else {
-        println!("{} ({}):\n", "Cached entries".bold(), cache_root.display());
+        outln!("{} ({}):\n", "Cached entries".bold(), cache_root.display());
 
         for entry in &entries {
             match &entry.meta {
@@ -151,7 +153,7 @@ fn handle_list(json: bool) -> Result<()> {
                     } else {
                         "single".to_string()
                     };
-                    println!(
+                    outln!(
                         "  {} — {} accounts, {} ({})",
                         entry.key.cyan(),
                         meta.account_count,
@@ -163,12 +165,12 @@ fn handle_list(json: bool) -> Result<()> {
                     let file_count = std::fs::read_dir(&entry.path)
                         .map(|rd| rd.filter_map(|e| e.ok()).count())
                         .unwrap_or(0);
-                    println!("  {} — {} files (no metadata)", entry.key.yellow(), file_count,);
+                    outln!("  {} — {} files (no metadata)", entry.key.yellow(), file_count,);
                 }
             }
         }
 
-        println!("\n{} entries total", entries.len());
+        outln!("\n{} entries total", entries.len());
     }
     Ok(())
 }
@@ -191,7 +193,7 @@ fn handle_clean(args: crate::cli::CacheCleanArgs, json: bool) -> Result<()> {
         if json {
             crate::output::print_json(&CacheCleanOutput { removed: 0 })?;
         } else {
-            eprintln!("No cache directory found at {}", cache_root.display());
+            errln!("No cache directory found at {}", cache_root.display());
         }
         return Ok(());
     }
@@ -224,7 +226,7 @@ fn handle_clean(args: crate::cli::CacheCleanArgs, json: bool) -> Result<()> {
     if json {
         crate::output::print_json(&CacheCleanOutput { removed })?;
     } else {
-        println!("Removed {} cache entries", removed);
+        outln!("Removed {} cache entries", removed);
     }
     Ok(())
 }
@@ -285,29 +287,29 @@ fn handle_info(args: crate::cli::CacheInfoArgs, json: bool) -> Result<()> {
     } else {
         match meta_result {
             Ok(meta) => {
-                println!("{}: {}", "Key".bold(), args.key);
-                println!("{}: {}", "Type".bold(), meta.cache_type);
-                println!("{}: {}", "Created".bold(), meta.created_at);
-                println!("{}: {}", "RPC".bold(), meta.rpc_url);
-                println!("{}: {}", "Accounts".bold(), meta.account_count);
-                println!("{}: {}", "Sonar version".bold(), meta.sonar_version);
+                outln!("{}: {}", "Key".bold(), args.key);
+                outln!("{}: {}", "Type".bold(), meta.cache_type);
+                outln!("{}: {}", "Created".bold(), meta.created_at);
+                outln!("{}: {}", "RPC".bold(), meta.rpc_url);
+                outln!("{}: {}", "Accounts".bold(), meta.account_count);
+                outln!("{}: {}", "Sonar version".bold(), meta.sonar_version);
                 if meta.transactions.len() > 1 || meta.cache_type == "bundle" {
-                    println!("{}:", "Transactions".bold());
+                    outln!("{}:", "Transactions".bold());
                     for (i, tx) in meta.transactions.iter().enumerate() {
                         let display = if tx.input.len() > 44 {
                             format!("{}...", &tx.input[..44])
                         } else {
                             tx.input.clone()
                         };
-                        println!("  {}: {} ({})", i + 1, display, tx.resolved_from);
+                        outln!("  {}: {} ({})", i + 1, display, tx.resolved_from);
                     }
                 }
             }
             Err(_) => {
-                println!("{}: {} (no _meta.json found)", "Key".bold(), args.key);
+                outln!("{}: {} (no _meta.json found)", "Key".bold(), args.key);
             }
         }
-        println!("{}: {} account files on disk", "Files".bold(), file_count);
+        outln!("{}: {} account files on disk", "Files".bold(), file_count);
     }
 
     Ok(())

@@ -1,11 +1,12 @@
 use anyhow::Result;
 
 use super::report::{BundleReport, Report};
+use super::stream::outln;
 
 /// Pretty-print any serializable value as JSON to stdout.
 pub(crate) fn print_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
-    println!("{json}");
+    outln!("{json}");
     Ok(())
 }
 

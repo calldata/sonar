@@ -4,6 +4,7 @@
 //! mint and token account data, including Token-2022 extensions.
 
 use serde_json::{Value, json};
+#[cfg(test)]
 use solana_pubkey::Pubkey;
 use spl_token::solana_program::program_option::COption;
 use spl_token::solana_program::program_pack::Pack;
@@ -31,34 +32,7 @@ use spl_token_2022::state::{Account as Token2022Account, Mint as Token2022Mint};
 use spl_token_group_interface::state::{TokenGroup, TokenGroupMember};
 use spl_token_metadata_interface::state::TokenMetadata;
 
-/// Token program ID
-fn legacy_program_id() -> Pubkey {
-    Pubkey::new_from_array(spl_token::ID.to_bytes())
-}
-
-/// Token-2022 program ID
-fn token2022_program_id() -> Pubkey {
-    Pubkey::new_from_array(spl_token_2022::ID.to_bytes())
-}
-
-/// Token program kind
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenProgramKind {
-    Legacy,
-    Token2022,
-}
-
-impl TokenProgramKind {
-    fn from_owner(owner: &Pubkey) -> Option<Self> {
-        if *owner == legacy_program_id() {
-            Some(TokenProgramKind::Legacy)
-        } else if *owner == token2022_program_id() {
-            Some(TokenProgramKind::Token2022)
-        } else {
-            None
-        }
-    }
-}
+use sonar_sim::TokenProgramKind;
 
 /// Decode a token account (mint or token account) if the owner is SPL Token or Token-2022.
 ///
@@ -521,6 +495,16 @@ fn pod_option_elgamal_to_string(
 }
 
 #[cfg(test)]
+fn legacy_program_id() -> Pubkey {
+    TokenProgramKind::Legacy.program_id()
+}
+
+#[cfg(test)]
+fn token2022_program_id() -> Pubkey {
+    TokenProgramKind::Token2022.program_id()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use spl_token::solana_program::program_option::COption;
@@ -790,9 +774,7 @@ mod tests {
         let mut state =
             StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut data).unwrap();
 
-        let fee = state
-            .init_extension::<ConfidentialTransferFeeConfig>(true)
-            .unwrap();
+        let fee = state.init_extension::<ConfidentialTransferFeeConfig>(true).unwrap();
         fee.authority = OptionalNonZeroPubkey::try_from(Some(fee_authority)).unwrap();
         fee.harvest_to_mint_enabled = true.into();
 
@@ -855,18 +837,14 @@ mod tests {
         let mut state =
             StateWithExtensionsMut::<Token2022Account>::unpack_uninitialized(&mut data).unwrap();
 
-        let ct = state
-            .init_extension::<ConfidentialTransferAccount>(true)
-            .unwrap();
+        let ct = state.init_extension::<ConfidentialTransferAccount>(true).unwrap();
         ct.approved = true.into();
         ct.allow_confidential_credits = true.into();
         ct.allow_non_confidential_credits = false.into();
         ct.pending_balance_credit_counter = 3u64.into();
         ct.maximum_pending_balance_credit_counter = 65_536u64.into();
 
-        state
-            .init_extension::<ConfidentialTransferFeeAmount>(true)
-            .unwrap();
+        state.init_extension::<ConfidentialTransferFeeAmount>(true).unwrap();
 
         state.base = Token2022Account {
             mint,
