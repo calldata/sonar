@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use crate::output::stream::outln;
+
 use anyhow::{Context, Result};
 use solana_pubkey::Pubkey;
 
@@ -29,7 +31,7 @@ pub(crate) fn handle(args: PdaArgs, json: bool) -> Result<()> {
     if json {
         crate::output::print_json(&PdaOutput { pda: pda.to_string(), bump })?;
     } else {
-        println!("{pda} {bump}");
+        outln!("{pda} {bump}");
     }
 
     Ok(())

@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use crate::output::stream::{errln, outln};
+
 use crate::core::rpc_client::{RpcClient, SendTransactionConfig};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -39,13 +41,13 @@ pub(crate) fn handle(args: SendArgs, json: bool) -> Result<()> {
     if json {
         crate::output::print_json(&SendOutput { signature: signature_text, explorer_url })?;
     } else {
-        println!("{}", signature_text);
-        eprintln!("{}", explorer_url);
+        outln!("{}", signature_text);
+        errln!("{}", explorer_url);
     }
 
     // Wait-confirmation status always goes to stderr regardless of mode
     if let Some(info) = wait_info {
-        eprintln!("{}", info);
+        errln!("{}", info);
     }
 
     Ok(())

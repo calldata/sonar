@@ -4,6 +4,7 @@ mod json;
 pub(crate) mod report;
 #[cfg(test)]
 mod snapshot_tests;
+pub(crate) mod stream;
 mod table;
 pub(crate) mod terminal;
 mod text;
@@ -18,13 +19,12 @@ use solana_pubkey::Pubkey;
 
 use crate::{core::transaction::ParsedTransaction, parsers::instruction::ParserRegistry};
 use sonar_sim::{
-    AccountOverride, ExecutionResult, PreparedTokenFunding, ResolvedAccounts, SolFunding,
+    AccountOverride, ExecutionResult, PreparedTokenFunding, ResolvedAccounts, SolBalanceChange,
+    SolFunding, TokenBalanceChange,
 };
 
-use report::{
-    BundleReport, LookupResolver, Report, SolBalanceChangeSection, TokenBalanceChangeSection,
-    TransactionSection,
-};
+use report::{BundleReport, LookupResolver, Report, TransactionSection};
+use stream::outln;
 
 /// Balance change display options.
 #[derive(Debug, Clone, Copy, Default)]
@@ -75,8 +75,8 @@ pub enum SimulationKind<'a> {
     Replay {
         parsed: &'a ParsedTransaction,
         simulation: &'a ExecutionResult,
-        sol_balance_changes: Vec<SolBalanceChangeSection>,
-        token_balance_changes: Vec<TokenBalanceChangeSection>,
+        sol_balance_changes: Vec<SolBalanceChange>,
+        token_balance_changes: Vec<TokenBalanceChange>,
     },
     /// A bundle of transactions executed sequentially.
     Bundle {
@@ -222,7 +222,7 @@ pub fn render_decode(req: DecodeRender) -> Result<()> {
         match sections.as_slice() {
             [single] => {
                 let json = serde_json::to_string_pretty(single)?;
-                println!("{json}");
+                outln!("{json}");
                 Ok(())
             }
             _ => json::render_json_array(&sections),

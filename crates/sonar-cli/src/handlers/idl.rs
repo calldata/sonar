@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::output::stream::outln;
+
 use anyhow::{Context, Result};
 use serde::Serialize;
 use solana_pubkey::Pubkey;
@@ -63,7 +65,7 @@ fn handle_address(args: IdlAddressArgs, json: bool) -> Result<()> {
         };
         crate::output::print_json(&output)?;
     } else {
-        println!("{idl_address}");
+        outln!("{idl_address}");
     }
 
     Ok(())
@@ -122,7 +124,7 @@ fn fetch_and_write_idls(
                         status: IdlFetchStatus::Ok,
                     });
                 } else {
-                    println!("{}", path.display());
+                    outln!("{}", path.display());
                 }
                 fetched += 1;
             }

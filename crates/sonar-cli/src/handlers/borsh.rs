@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use crate::output::stream::outln;
+
 use crate::cli::{BorshArgs, BorshCommands, BorshDeArgs, BorshSerArgs};
 use crate::converters::borsh_decode::decode_borsh;
 use crate::converters::borsh_encode::encode_borsh;
@@ -41,7 +43,7 @@ fn handle_de(args: BorshDeArgs) -> Result<()> {
     }
 
     let output = serde_json::to_string_pretty(&value)?;
-    println!("{output}");
+    outln!("{output}");
     Ok(())
 }
 
@@ -75,7 +77,7 @@ fn handle_ser(args: BorshSerArgs, json: bool) -> Result<()> {
     if json {
         crate::output::print_json(&BorshSerOutput { hex: hex_str })?;
     } else {
-        println!("{hex_str}");
+        outln!("{hex_str}");
     }
     Ok(())
 }

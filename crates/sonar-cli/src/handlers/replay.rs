@@ -13,7 +13,7 @@ use solana_transaction_status_client_types::{
 };
 use sonar_sim::{
     ExecutionResult, ExecutionStatus, ResolvedAccounts, ResolvedLookup, ReturnData,
-    SimulationMetadata,
+    SimulationMetadata, SolBalanceChange, TokenBalanceChange, sort_by_magnitude,
 };
 
 use solana_account::AccountSharedData;
@@ -24,7 +24,6 @@ use crate::core::rpc_client::{GetTransactionConfig, RpcClient};
 use crate::core::transaction::{
     ParsedTransaction, encode_transaction_to_base64, parse_raw_transaction,
 };
-use crate::output::report::{SolBalanceChangeSection, TokenBalanceChangeSection};
 use crate::output::{self, BalanceChangeOptions, LogDisplayOptions, RenderOptions};
 use crate::parsers::instruction::ParserRegistry;
 use crate::utils::progress::Progress;
@@ -311,33 +310,31 @@ fn resolve_from_meta(
     (lookups, ordered_keys)
 }
 
-/// Compute SOL and token balance changes directly from RPC balance arrays.
+/// Compute SOL and token balance changes from RPC balance arrays.
+///
+/// Produces engine [`SolBalanceChange`]/[`TokenBalanceChange`] values — the same
+/// types the local simulation path yields — so the delta rule, zero-change
+/// filtering, and magnitude ordering are the shared engine definitions rather
+/// than a replay-only reimplementation. Rendering to display sections happens in
+/// `output::report`, identically for simulate and replay.
 fn compute_balance_changes(
     meta: &Option<UiTransactionStatusMeta>,
     ordered_keys: &[Pubkey],
-) -> (Vec<SolBalanceChangeSection>, Vec<TokenBalanceChangeSection>) {
+) -> (Vec<SolBalanceChange>, Vec<TokenBalanceChange>) {
     let Some(meta) = meta else {
         return (Vec::new(), Vec::new());
     };
 
-    let sol_changes: Vec<SolBalanceChangeSection> = meta
+    let mut sol_changes: Vec<SolBalanceChange> = meta
         .pre_balances
         .iter()
         .zip(&meta.post_balances)
         .enumerate()
-        .filter(|(_, (pre, post))| pre != post)
         .filter_map(|(i, (pre, post))| {
-            let pubkey = ordered_keys.get(i)?;
-            let change = *post as i128 - *pre as i128;
-            Some(SolBalanceChangeSection {
-                account: pubkey.to_string(),
-                before: *pre,
-                after: *post,
-                change,
-                change_sol: crate::converters::sol::lamports_to_sol(change),
-            })
+            SolBalanceChange::from_balances(*ordered_keys.get(i)?, *pre, *post)
         })
         .collect();
+    sort_by_magnitude(&mut sol_changes);
 
     let pre_tokens = match &meta.pre_token_balances {
         OptionSerializer::Some(b) => b.as_slice(),
@@ -357,7 +354,7 @@ fn compute_token_balance_changes(
     pre: &[UiTransactionTokenBalance],
     post: &[UiTransactionTokenBalance],
     ordered_keys: &[Pubkey],
-) -> Vec<TokenBalanceChangeSection> {
+) -> Vec<TokenBalanceChange> {
     let mut changes = Vec::new();
 
     let pre_map: HashMap<u8, &UiTransactionTokenBalance> =
@@ -373,9 +370,7 @@ fn compute_token_balance_changes(
             .unwrap_or(0);
         let post_amount: u64 = post_tb.ui_token_amount.amount.parse().unwrap_or(0);
 
-        if pre_amount != post_amount {
-            changes.push(make_token_change(post_tb, pubkey, pre_amount, post_amount));
-        }
+        changes.extend(make_token_change(post_tb, pubkey, pre_amount, post_amount));
     }
 
     // Closed token accounts: exist in pre but not in post
@@ -386,35 +381,29 @@ fn compute_token_balance_changes(
         }
         let Some(pubkey) = ordered_keys.get(pre_tb.account_index as usize) else { continue };
         let pre_amount: u64 = pre_tb.ui_token_amount.amount.parse().unwrap_or(0);
-        if pre_amount != 0 {
-            changes.push(make_token_change(pre_tb, pubkey, pre_amount, 0));
-        }
+        changes.extend(make_token_change(pre_tb, pubkey, pre_amount, 0));
     }
 
+    sort_by_magnitude(&mut changes);
     changes
 }
 
+/// Build a token balance change from an RPC token-balance entry, or `None` when
+/// the amount is unchanged. Owner/mint come from the RPC entry (a missing owner
+/// falls back to the default pubkey); the delta and zero-skip are the engine's.
 fn make_token_change(
     tb: &UiTransactionTokenBalance,
     pubkey: &Pubkey,
     before: u64,
     after: u64,
-) -> TokenBalanceChangeSection {
-    let change = after as i128 - before as i128;
+) -> Option<TokenBalanceChange> {
+    let owner = match &tb.owner {
+        OptionSerializer::Some(s) => Pubkey::from_str(s).unwrap_or_default(),
+        _ => Pubkey::default(),
+    };
+    let mint = Pubkey::from_str(&tb.mint).unwrap_or_default();
     let decimals = tb.ui_token_amount.decimals;
-    TokenBalanceChangeSection {
-        owner: match &tb.owner {
-            OptionSerializer::Some(s) => s.clone(),
-            _ => String::new(),
-        },
-        token_account: pubkey.to_string(),
-        mint: tb.mint.clone(),
-        before,
-        after,
-        change,
-        decimals,
-        ui_change: crate::converters::sol::raw_to_ui_amount(change, decimals),
-    }
+    TokenBalanceChange::from_balances(*pubkey, owner, mint, before, after, decimals)
 }
 
 // ---------------------------------------------------------------------------

@@ -153,7 +153,7 @@ fn prepare_single_token_funding(
         owner,
         decimals,
         amount_raw,
-        ui_amount: raw_to_ui_amount(amount_raw, decimals),
+        ui_amount: raw_to_ui_amount(amount_raw as i128, decimals),
         program_kind,
     })
 }

@@ -15,10 +15,11 @@ use crate::parsers::instruction::{
 use sonar_sim::{
     AccountOverride, ExecutionResult, ExecutionStatus, ResolvedAccounts, ResolvedLookup,
     SimulationMetadata, compute_sol_changes, compute_token_changes, extract_mint_decimals_combined,
+    raw_to_ui_amount,
 };
 use sonar_sim::{SolBalanceChange, TokenBalanceChange};
 
-use crate::converters::sol::{lamports_to_sol, raw_to_ui_amount};
+use crate::converters::sol::lamports_to_sol;
 
 use super::{BalanceChangeOptions, SimulationContext};
 
@@ -259,15 +260,18 @@ impl Report {
         }
     }
 
-    /// Construct a replay report with pre-computed balance changes.
-    /// No SimulationContext needed — replay is read-only historical data.
+    /// Construct a replay report from balance changes computed from RPC metadata.
+    /// No SimulationContext needed — replay is read-only historical data. The
+    /// changes arrive as engine [`SolBalanceChange`]/[`TokenBalanceChange`] values
+    /// and are rendered through the same `from_change` mapping the simulate path
+    /// uses, so the display (UI amounts, ordering) is identical across both.
     pub(super) fn from_replay(
         parsed: &ParsedTransaction,
         resolved: &ResolvedAccounts,
         simulation: &ExecutionResult,
         parser_registry: &mut ParserRegistry,
-        sol_balance_changes: Vec<SolBalanceChangeSection>,
-        token_balance_changes: Vec<TokenBalanceChangeSection>,
+        sol_balance_changes: Vec<SolBalanceChange>,
+        token_balance_changes: Vec<TokenBalanceChange>,
     ) -> Self {
         let resolver = LookupResolver::new(resolved.lookup_details());
         let transaction =
@@ -281,8 +285,14 @@ impl Report {
             overrides: Vec::new(),
             fundings: Vec::new(),
             token_fundings: Vec::new(),
-            sol_balance_changes,
-            token_balance_changes,
+            sol_balance_changes: sol_balance_changes
+                .iter()
+                .map(SolBalanceChangeSection::from_change)
+                .collect(),
+            token_balance_changes: token_balance_changes
+                .iter()
+                .map(TokenBalanceChangeSection::from_change)
+                .collect(),
         }
     }
 }

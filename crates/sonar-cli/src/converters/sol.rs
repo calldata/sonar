@@ -67,11 +67,6 @@ pub(crate) fn lamports_to_sol(lamports: i128) -> f64 {
     lamports as f64 / LAMPORTS_PER_SOL as f64
 }
 
-/// Convert a raw token amount or delta to a UI amount using `decimals`.
-pub(crate) fn raw_to_ui_amount(raw: i128, decimals: u8) -> f64 {
-    raw as f64 / 10f64.powi(decimals as i32)
-}
-
 pub(crate) fn format_sol(lamports: u64) -> String {
     if lamports == 0 {
         return "0".to_string();

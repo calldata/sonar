@@ -1,4 +1,6 @@
 use std::fs;
+
+use crate::output::stream::outln;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -69,7 +71,7 @@ pub(crate) fn handle(args: AccountArgs, json: bool) -> Result<()> {
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        outln!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         crate::output::render_account_text(
             &pubkey_str,
@@ -505,7 +507,7 @@ fn wrap_account_data_output<S: serde::Serialize>(
 /// Field order follows Solana Account struct: lamports, data, owner, executable, rent_epoch
 fn print_raw_account_data(account: &solana_account::Account) {
     let output = raw_account_data_json(account);
-    println!("{}", serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string()));
+    outln!("{}", serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string()));
 }
 
 fn raw_account_data_json(account: &solana_account::Account) -> Value {

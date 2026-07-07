@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::output::stream::outln;
+
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 
@@ -30,8 +32,8 @@ fn handle_list(json: bool) -> Result<()> {
     } else {
         for key in config::all_config_keys() {
             match current.value_for_key(*key) {
-                Some(value) => println!("{}={}", key.as_str(), value),
-                None => println!("{}=<unset>", key.as_str()),
+                Some(value) => outln!("{}={}", key.as_str(), value),
+                None => outln!("{}=<unset>", key.as_str()),
             }
         }
     }
@@ -54,8 +56,8 @@ fn handle_get(key: &str, json: bool) -> Result<()> {
         crate::output::print_json(&ConfigGetOutput { key: key.as_str().to_string(), value })?;
     } else {
         match value {
-            Some(v) => println!("{}", v),
-            None => println!("<unset>"),
+            Some(v) => outln!("{}", v),
+            None => outln!("<unset>"),
         }
     }
 
@@ -90,7 +92,7 @@ fn handle_set(args: ConfigSetArgs, json: bool) -> Result<()> {
             value: normalized,
         })?;
     } else {
-        println!("{}={}", key.as_str(), normalized);
+        outln!("{}={}", key.as_str(), normalized);
     }
 
     Ok(())

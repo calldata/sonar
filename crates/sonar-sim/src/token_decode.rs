@@ -165,7 +165,11 @@ pub fn try_decode_token_account(
 
 // ── Amount conversion ──
 
-pub(crate) fn raw_to_ui_amount(amount_raw: u64, decimals: u8) -> f64 {
+/// Convert a raw token amount (or a signed delta) to its UI value using the
+/// mint's `decimals`. Accepts `i128` so the same rule serves both non-negative
+/// balances and negative balance changes — this is the single definition of the
+/// raw→UI conversion shared across the engine and the CLI's display layer.
+pub fn raw_to_ui_amount(amount_raw: i128, decimals: u8) -> f64 {
     let factor = 10f64.powi(decimals as i32);
     if factor == 0.0 { amount_raw as f64 } else { (amount_raw as f64) / factor }
 }

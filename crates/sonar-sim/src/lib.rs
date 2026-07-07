@@ -54,8 +54,8 @@ pub use types::{
 
 // ── Results & balance changes ──
 pub use balance_changes::{
-    SolBalanceChange, TokenBalanceChange, compute_sol_changes, compute_token_changes,
-    extract_mint_decimals_combined,
+    BalanceChange, SolBalanceChange, TokenBalanceChange, compute_sol_changes,
+    compute_token_changes, extract_mint_decimals_combined, sort_by_magnitude,
 };
 pub use result::SimulationResult;
 pub use types::{ReturnData, SimulationMetadata};
@@ -87,5 +87,6 @@ pub use known_programs::{is_litesvm_builtin_program, is_native_or_sysvar};
 
 // ── Token account decoding ──
 pub use token_decode::{
-    DecodedTokenAccount, TokenProgramKind, read_mint_decimals, try_decode_token_account,
+    DecodedTokenAccount, TokenProgramKind, raw_to_ui_amount, read_mint_decimals,
+    try_decode_token_account,
 };

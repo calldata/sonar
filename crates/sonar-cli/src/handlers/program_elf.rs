@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use crate::output::stream::outln;
+
 use crate::core::rpc_client::RpcClient;
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
@@ -66,10 +68,10 @@ pub(crate) fn handle(args: ProgramDataArgs) -> Result<()> {
             expected_hash.strip_prefix("0x").unwrap_or(&expected_hash).to_lowercase();
 
         if actual_hash == expected_hash {
-            println!("true");
+            outln!("true");
             Ok(())
         } else {
-            println!("false");
+            outln!("false");
             Err(anyhow!("SHA256 mismatch: expected {}, got {}", expected_hash, actual_hash))
         }
     } else if let Some(output_path) = args.output {
@@ -79,7 +81,7 @@ pub(crate) fn handle(args: ProgramDataArgs) -> Result<()> {
             std::fs::write(&output_path, &elf_data).with_context(|| {
                 format!("Failed to write program data to {}", output_path.display())
             })?;
-            println!("Wrote {} bytes to {}", elf_data.len(), output_path.display());
+            outln!("Wrote {} bytes to {}", elf_data.len(), output_path.display());
             Ok(())
         }
     } else {
