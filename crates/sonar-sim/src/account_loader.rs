@@ -771,7 +771,7 @@ mod tests {
         fn make_bpf_program(programdata_address: &Pubkey) -> AccountSharedData {
             let state =
                 UpgradeableLoaderState::Program { programdata_address: *programdata_address };
-            let data = bincode::serialize(&state).unwrap();
+            let data = wincode::serialize(&state).unwrap();
             AccountSharedData::from(Account {
                 lamports: 1,
                 data,

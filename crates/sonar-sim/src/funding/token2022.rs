@@ -2,9 +2,12 @@ use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_pubkey::Pubkey;
 use solana_rent::Rent;
 use spl_token::solana_program::program_option::COption;
-use spl_token_2022::extension::{BaseStateWithExtensions, BaseStateWithExtensionsMut};
-use spl_token_2022::extension::{ExtensionType, StateWithExtensions, StateWithExtensionsMut};
+use spl_token_2022::extension::{
+    BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
+    StateWithExtensionsMut,
+};
 use spl_token_2022::state::{Account as Token2022Account, AccountState, Mint as Token2022Mint};
+use spl_token_2022_interface::extension::account_len::try_for_each_required_init_account_extension;
 
 use crate::error::{Result, SonarSimError};
 use crate::token_decode::{TokenProgramKind, to_program_pubkey, token2022_program_id};
@@ -24,14 +27,19 @@ pub(super) fn build_token_account_with_extensions(
                 reason: format!("Failed to unpack token-2022 mint {}: {}", mint, e),
             }
         })?;
-    let mint_extension_types =
-        mint_state.get_extension_types().map_err(|e| SonarSimError::Token {
-            account: Some(*mint),
-            reason: format!("Failed to get mint extension types: {}", e),
-        })?;
 
-    let required_extensions =
-        ExtensionType::get_required_init_account_extensions(&mint_extension_types);
+    // Upstream replaced `ExtensionType::get_required_init_account_extensions`
+    // (which allocated the intermediate list) with this visitor over the mint's
+    // TLV bytes. It takes the TLV slice, not the whole account data.
+    let mut required_extensions: Vec<ExtensionType> = Vec::new();
+    try_for_each_required_init_account_extension(mint_state.get_tlv_data(), |extension_type| {
+        required_extensions.push(extension_type);
+        Ok(())
+    })
+    .map_err(|e| SonarSimError::Token {
+        account: Some(*mint),
+        reason: format!("Failed to read token-2022 mint {} extensions: {}", mint, e),
+    })?;
     let account_len =
         ExtensionType::try_calculate_account_len::<Token2022Account>(&required_extensions)
             .map_err(|e| SonarSimError::Token {

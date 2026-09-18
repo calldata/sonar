@@ -31,6 +31,15 @@ sonar simulate <TX> --rpc-url <RPC_URL> -b -d
 sonar simulate <TX> --rpc-url <RPC_URL> --json
 ```
 
+### Transaction Formats
+
+`legacy`, `v0`, and `v1` (SIMD-0385) transactions are all accepted in Base58 or
+Base64. v1 transactions additionally show their header config mask requests
+(priority fee, compute unit limit, loaded accounts data size limit, heap size),
+and those requests are what the simulation runs with.
+See [Transaction Formats](transaction-formats.md) for the wire format, the config
+defaults, and the remaining limitations.
+
 ### Instruction Input
 
 Use `--ix` to simulate one or more raw instructions without first building a

@@ -47,7 +47,7 @@ pub struct RpcArgs {
     pub rpc_batch_size: usize,
 }
 
-/// Crate version plus the git commit it was built from, e.g. `0.7.1 (7fe88d4)`.
+/// Crate version plus the git commit it was built from, e.g. `0.8.0 (7fe88d4)`.
 /// `SONAR_GIT_HASH` is set by `build.rs`.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SONAR_GIT_HASH"), ")");
 

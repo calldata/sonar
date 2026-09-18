@@ -14,6 +14,7 @@ use solana_signature::Signature;
 use solana_transaction::versioned::{TransactionVersion, VersionedTransaction};
 
 use crate::error::{Result, SonarSimError};
+use crate::v1::V1Transaction;
 
 /// Internal extension trait for mutable access to the shared fields of
 /// `VersionedMessage`. Both `Legacy` and `V0` messages have identical
@@ -30,6 +31,7 @@ impl VersionedMessageExt for VersionedMessage {
         match self {
             VersionedMessage::Legacy(m) => &m.account_keys,
             VersionedMessage::V0(m) => &m.account_keys,
+            VersionedMessage::V1(m) => &m.account_keys,
         }
     }
 
@@ -37,6 +39,7 @@ impl VersionedMessageExt for VersionedMessage {
         match self {
             VersionedMessage::Legacy(m) => &mut m.account_keys,
             VersionedMessage::V0(m) => &mut m.account_keys,
+            VersionedMessage::V1(m) => &mut m.account_keys,
         }
     }
 
@@ -44,6 +47,7 @@ impl VersionedMessageExt for VersionedMessage {
         match self {
             VersionedMessage::Legacy(m) => &mut m.instructions,
             VersionedMessage::V0(m) => &mut m.instructions,
+            VersionedMessage::V1(m) => &mut m.instructions,
         }
     }
 
@@ -51,6 +55,7 @@ impl VersionedMessageExt for VersionedMessage {
         match self {
             VersionedMessage::Legacy(m) => &mut m.header,
             VersionedMessage::V0(m) => &mut m.header,
+            VersionedMessage::V1(m) => &mut m.header,
         }
     }
 }
@@ -71,12 +76,118 @@ impl fmt::Display for RawTransactionEncoding {
     }
 }
 
+/// Wire format of a parsed transaction.
+///
+/// Upstream's [`TransactionVersion`] cannot express v1, so Sonar models the
+/// format itself. `TransactionFormat::V1` is always accompanied by a parsed
+/// [`crate::v1::V1Transaction`] in [`ParsedTransaction::v1`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransactionFormat {
+    Legacy,
+    V0,
+    V1,
+}
+
+impl TransactionFormat {
+    /// Lower-case wire name, matching the values used in JSON output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::V0 => "v0",
+            Self::V1 => "v1",
+        }
+    }
+}
+
+impl fmt::Display for TransactionFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl From<TransactionVersion> for TransactionFormat {
+    fn from(version: TransactionVersion) -> Self {
+        match version {
+            TransactionVersion::Legacy(_) => Self::Legacy,
+            TransactionVersion::Number(1) => Self::V1,
+            // `0` is v0; no other version survives deserialization.
+            TransactionVersion::Number(_) => Self::V0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedTransaction {
     pub encoding: RawTransactionEncoding,
-    pub version: TransactionVersion,
+    /// Wire format the input used.
+    pub format: TransactionFormat,
+    /// Executable form of the transaction.
+    ///
+    /// For `TransactionFormat::V1` this is the native v1 message produced by
+    /// [`V1Transaction::to_versioned_transaction`], so it can be handed to the
+    /// execution backend as-is; the richer parse is preserved in
+    /// [`ParsedTransaction::v1`] and
+    /// [`ParsedTransaction::to_wire_bytes`] is what produces wire bytes.
     pub transaction: VersionedTransaction,
     pub account_plan: MessageAccountPlan,
+    /// Full v1 parse, present exactly when `format` is [`TransactionFormat::V1`].
+    pub v1: Option<V1Transaction>,
+}
+
+impl ParsedTransaction {
+    /// Whether the input used the SIMD-0385 v1 format.
+    pub fn is_v1(&self) -> bool {
+        self.format == TransactionFormat::V1
+    }
+
+    /// Verify every signature against the payload this format signs.
+    ///
+    /// v1 signatures cover the v1 payload (see
+    /// [`V1Transaction::verify_signatures`]); legacy and v0 signatures cover the
+    /// serialized message, which is what the VM checks in
+    /// `SanitizedTransaction::verify`. Callers use this where the VM-level check
+    /// cannot run — for v1 always, and for the rest of a batch that contains one.
+    pub fn verify_signatures(&self) -> Result<()> {
+        match &self.v1 {
+            Some(v1) => v1.verify_signatures(),
+            // Fail closed: `format == V1` without a v1 view means the signed payload
+            // is unknown, and reporting success would claim a check that never ran.
+            None if self.is_v1() => Err(SonarSimError::TransactionParse {
+                reason: "v1 transaction has no v1 view, so its signing payload is unknown".into(),
+            }),
+            None => verify_message_signatures(&self.transaction),
+        }
+    }
+
+    /// Serialize back to the format the input used.
+    pub fn to_wire_bytes(&self) -> Result<Vec<u8>> {
+        wire_bytes(&self.transaction, self.v1.as_ref())
+    }
+}
+
+/// Serialize a transaction to the wire bytes of the format it arrived in.
+///
+/// `v1` is the transaction's v1 view, which callers pass exactly when the
+/// transaction is a v1 transaction. A v1 transaction has to be written as v1:
+/// that layout is what its signatures cover, and its signature array is a
+/// trailing fixed-length array rather than a `short_vec`.
+///
+/// `wincode` writes the other two formats: upstream froze the
+/// [`VersionedTransaction`] ABI on it (`abi_serializer = "wincode"`) and its
+/// default config reproduces the bincode 1.3 layout legacy and v0 use. The serde
+/// encoding of the same type is *not* a wire format — for a v1 message it writes
+/// a `short_vec` signature count and an enum-tagged message — so a re-encode
+/// through `bincode` would produce bytes no v1-aware client accepts.
+pub fn wire_bytes(
+    transaction: &VersionedTransaction,
+    v1: Option<&V1Transaction>,
+) -> Result<Vec<u8>> {
+    match v1 {
+        Some(v1) => Ok(v1.serialize()),
+        None => wincode::serialize(transaction)
+            .map_err(|err| SonarSimError::Serialization { reason: err.to_string() }),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +218,42 @@ pub struct LookupLocation {
     pub writable: bool,
 }
 
+/// Verify legacy/v0 signatures against the serialized message.
+///
+/// Mirrors `SanitizedTransaction::verify` from `solana-transaction`: signature `i`
+/// is checked against the static account key at index `i`, over the message bytes.
+fn verify_message_signatures(tx: &VersionedTransaction) -> Result<()> {
+    let format = TransactionFormat::from(tx.version());
+    let required = usize::from(tx.message.header().num_required_signatures);
+    let signers = tx.message.static_account_keys();
+
+    // Upstream's sanitization requires a signature per required signer and a signer
+    // per static account key. Checking it here matters because the loop below `zip`s:
+    // with fewer signatures than the header demands it would verify nothing and
+    // report success for a transaction whose signatures were never checked.
+    if tx.signatures.len() != required || signers.len() < required {
+        return Err(SonarSimError::TransactionParse {
+            reason: format!(
+                "{format} transaction carries {} signature(s) and {} static account key(s), but                  its header requires {required} signature(s)",
+                tx.signatures.len(),
+                signers.len()
+            ),
+        });
+    }
+
+    let message_bytes = tx.message.serialize();
+    for (index, (signature, key)) in tx.signatures.iter().zip(signers.iter()).enumerate() {
+        if !signature.verify(key.as_ref(), &message_bytes) {
+            return Err(SonarSimError::TransactionParse {
+                reason: format!(
+                    "{format} transaction signature {index} is invalid for signer {key}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_raw_transaction(raw: &str) -> Result<ParsedTransaction> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -119,20 +266,54 @@ pub fn parse_raw_transaction(raw: &str) -> Result<ParsedTransaction> {
 
     for encoding in [RawTransactionEncoding::Base64, RawTransactionEncoding::Base58] {
         match decode_bytes(trimmed, encoding) {
-            Ok(bytes) => match bincode::deserialize::<VersionedTransaction>(&bytes) {
-                Ok(transaction) => {
-                    let version = transaction.version();
-                    let account_plan = MessageAccountPlan::from_transaction(&transaction);
-                    return Ok(ParsedTransaction { encoding, version, transaction, account_plan });
-                }
-                Err(err) => errors.push(format!(
-                    "{} deserialization failed: {err}",
-                    match encoding {
-                        RawTransactionEncoding::Base58 => "Base58",
-                        RawTransactionEncoding::Base64 => "Base64",
+            Ok(bytes) => {
+                // v1 has its own wire layout (trailing fixed-length signature
+                // array, no `short_vec` prefixes), so it cannot go through
+                // bincode and is detected by its version byte first.
+                if V1Transaction::is_v1_bytes(&bytes) {
+                    match parse_v1_transaction(bytes, encoding) {
+                        Ok(parsed) => return Ok(parsed),
+                        Err(err) => {
+                            errors.push(format!("v1 deserialization failed: {err}"));
+                            continue;
+                        }
                     }
-                )),
-            },
+                }
+
+                match wincode::deserialize::<VersionedTransaction>(&bytes) {
+                    Ok(transaction) => {
+                        // Upstream switches on the same discriminator this parser
+                        // checks above (`V1_PREFIX`), so a v1 message means the check
+                        // was bypassed. Failing closed keeps `format == V1` from ever
+                        // being paired with `v1: None`: that pair reads as "v1, so the
+                        // signatures are verified at parse time" while nothing does.
+                        if matches!(transaction.message, VersionedMessage::V1(_)) {
+                            debug_assert!(false, "v1 wire bytes must go through the v1 parser");
+                            return Err(SonarSimError::TransactionParse {
+                                reason: "v1 transaction reached the generic parser; the version \
+                                         discriminator check has to run first"
+                                    .into(),
+                            });
+                        }
+                        let format = TransactionFormat::from(transaction.version());
+                        let account_plan = MessageAccountPlan::from_transaction(&transaction);
+                        return Ok(ParsedTransaction {
+                            encoding,
+                            format,
+                            transaction,
+                            account_plan,
+                            v1: None,
+                        });
+                    }
+                    Err(err) => errors.push(format!(
+                        "{} deserialization failed: {err}",
+                        match encoding {
+                            RawTransactionEncoding::Base58 => "Base58",
+                            RawTransactionEncoding::Base64 => "Base64",
+                        }
+                    )),
+                }
+            }
             Err(err) => errors.push(err.to_string()),
         }
     }
@@ -140,6 +321,24 @@ pub fn parse_raw_transaction(raw: &str) -> Result<ParsedTransaction> {
     let merged = errors.join("; ");
     Err(SonarSimError::TransactionParse {
         reason: format!("Failed to parse raw transaction: {merged}"),
+    })
+}
+
+/// Parse v1 wire bytes into a [`ParsedTransaction`], keeping the message in the
+/// native v1 form the simulation backend executes.
+fn parse_v1_transaction(
+    bytes: Vec<u8>,
+    encoding: RawTransactionEncoding,
+) -> Result<ParsedTransaction> {
+    let v1 = V1Transaction::parse(&bytes)?;
+    let transaction = v1.to_versioned_transaction();
+    let account_plan = MessageAccountPlan::from_transaction(&transaction);
+    Ok(ParsedTransaction {
+        encoding,
+        format: TransactionFormat::V1,
+        transaction,
+        account_plan,
+        v1: Some(v1),
     })
 }
 
@@ -910,7 +1109,7 @@ mod tests {
     #[test]
     fn parse_base64_transaction() {
         let (versioned, payer) = sample_transaction();
-        let bytes = bincode::serialize(&versioned).unwrap();
+        let bytes = wincode::serialize(&versioned).unwrap();
         let base64 = BASE64_STANDARD.encode(&bytes);
 
         let parsed = parse_raw_transaction(&base64).expect("parse base64");
@@ -922,7 +1121,7 @@ mod tests {
     #[test]
     fn parse_base58_transaction() {
         let (versioned, _) = sample_transaction();
-        let bytes = bincode::serialize(&versioned).unwrap();
+        let bytes = wincode::serialize(&versioned).unwrap();
         let base58 = bs58::encode(&bytes).into_string();
 
         let parsed = parse_raw_transaction(&base58).expect("parse base58");
@@ -2049,5 +2248,156 @@ mod tests {
         // "second" memo survives at index 0.
         assert_eq!(tx.message.instructions().len(), 2);
         assert_eq!(tx.message.instructions()[0].data, b"second");
+    }
+}
+
+#[cfg(test)]
+mod signature_mirror_tests {
+    use super::*;
+    use solana_hash::Hash;
+    use solana_keypair::Keypair;
+    use solana_message::v0::LoadedAddresses;
+    use solana_message::{Message, SimpleAddressLoader};
+    use solana_pubkey::Pubkey;
+    use solana_signature::Signature;
+    use solana_signer::Signer;
+    use solana_system_interface::instruction as system_instruction;
+    use solana_transaction::Transaction;
+    use solana_transaction::sanitized::SanitizedTransaction;
+    use std::collections::HashSet;
+
+    /// The VM's own verdict: `None` when the transaction does not even sanitize.
+    fn upstream_verdict(tx: &VersionedTransaction) -> Option<bool> {
+        SanitizedTransaction::try_create(
+            tx.clone(),
+            Hash::new_unique(),
+            None,
+            SimpleAddressLoader::Enabled(LoadedAddresses::default()),
+            &HashSet::new(),
+        )
+        .ok()
+        .map(|sanitized| sanitized.verify().is_ok())
+    }
+
+    /// A signed legacy transfer, plus a copy with one signature byte flipped.
+    fn signed_legacy_pair() -> (VersionedTransaction, VersionedTransaction) {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let instruction = system_instruction::transfer(&payer.pubkey(), &recipient, 1_000);
+        let message = Message::new(&[instruction], Some(&payer.pubkey()));
+        let signed =
+            VersionedTransaction::from(Transaction::new(&[&payer], message, Hash::new_unique()));
+
+        let mut tampered = signed.clone();
+        let mut bytes = [0u8; 64];
+        bytes.copy_from_slice(tampered.signatures[0].as_ref());
+        bytes[0] ^= 0x0f;
+        tampered.signatures[0] = Signature::from(bytes);
+        (signed, tampered)
+    }
+
+    /// [`verify_message_signatures`] mirrors upstream's `SanitizedTransaction::verify`
+    /// because the VM cannot verify a v1 signature and so skips the check for a whole
+    /// batch containing v1. A mirror drifts, so both are asked the same questions.
+    #[test]
+    fn legacy_signature_check_agrees_with_the_reference_implementation() {
+        let (valid, tampered) = signed_legacy_pair();
+        assert!(verify_message_signatures(&valid).is_ok(), "mirror accepts a valid signature");
+        assert_eq!(upstream_verdict(&valid), Some(true), "upstream accepts a valid signature");
+        assert!(
+            verify_message_signatures(&tampered).is_err(),
+            "mirror rejects a tampered signature"
+        );
+        assert_eq!(upstream_verdict(&tampered), Some(false), "upstream rejects it too");
+
+        // A header that declares a signer the wire does not carry: upstream refuses
+        // to sanitize it, and the mirror must not call it verified just because the
+        // signature loop had nothing to iterate over.
+        let mut stripped = valid.clone();
+        stripped.signatures.clear();
+        assert!(
+            verify_message_signatures(&stripped).is_err(),
+            "mirror rejects a missing signature"
+        );
+        assert_eq!(upstream_verdict(&stripped), None, "upstream will not sanitize it");
+    }
+}
+
+#[cfg(test)]
+mod v1_tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    /// One-signature v1 transaction from the reference implementation: a system
+    /// transfer of 1_000_000 lamports with a 5_000-lamport priority fee, a
+    /// 200_000 compute unit limit, a 64 MiB loaded accounts data size limit and
+    /// a 32 KiB heap requested in the header.
+    fn v1_transfer_tx() -> &'static str {
+        // The reference-implementation fixture, shared by every crate that
+        // exercises the v1 wire format (the file keeps a trailing newline).
+        include_str!("../tests/fixtures/v1_transfer.b64").trim()
+    }
+    const V1_PAYER: &str = "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB";
+
+    #[test]
+    fn parse_raw_transaction_detects_v1() {
+        let parsed = parse_raw_transaction(v1_transfer_tx()).expect("v1 transaction parses");
+
+        assert_eq!(parsed.encoding, RawTransactionEncoding::Base64);
+        assert_eq!(parsed.format, TransactionFormat::V1);
+        assert!(parsed.is_v1());
+        assert_eq!(parsed.format.label(), "v1");
+
+        let v1 = parsed.v1.as_ref().expect("v1 parse is retained");
+        assert_eq!(v1.config.priority_fee, Some(5_000));
+        assert_eq!(v1.fee_payer().map(|key| key.to_string()), Some(V1_PAYER.to_string()));
+
+        // The executable form is the native v1 message, so the backend sees the
+        // header config as well as the message; every v1 address is static and
+        // v1 has no lookups.
+        assert!(matches!(parsed.transaction.message, VersionedMessage::V1(_)));
+        assert_eq!(parsed.account_plan.static_accounts, v1.addresses);
+        assert!(parsed.account_plan.address_lookups.is_empty());
+    }
+
+    #[test]
+    fn v1_wire_bytes_round_trip_exactly() {
+        let parsed = parse_raw_transaction(v1_transfer_tx()).expect("v1 transaction parses");
+        let wire = parsed.to_wire_bytes().expect("serializes");
+        assert_eq!(BASE64.encode(&wire), v1_transfer_tx());
+        // The executable form is a v1 message, so serializing it reproduces the
+        // input — what the backend runs is what the cluster accepted.
+        assert_eq!(wincode::serialize(&parsed.transaction).unwrap(), wire);
+    }
+
+    #[test]
+    fn v1_detection_works_for_base58_input() {
+        let raw = BASE64.decode(v1_transfer_tx()).expect("fixture is valid base64");
+        let base58 = bs58::encode(&raw).into_string();
+        let parsed = parse_raw_transaction(&base58).expect("v1 transaction parses from base58");
+        assert_eq!(parsed.format, TransactionFormat::V1);
+        assert_eq!(parsed.encoding, RawTransactionEncoding::Base58);
+    }
+
+    #[test]
+    fn malformed_v1_reports_v1_specific_reason() {
+        let mut raw = BASE64.decode(v1_transfer_tx()).expect("fixture is valid base64");
+        raw.push(0x00);
+        let err = parse_raw_transaction(&BASE64.encode(&raw)).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("v1 deserialization failed"), "{message}");
+        assert!(message.contains("trailing byte"), "{message}");
+    }
+
+    #[test]
+    fn v1_is_detected_before_the_generic_wire_parser() {
+        // Upstream can read v1 wire bytes too, so Sonar's own detection has to
+        // win: the parse must be filed as v1 and keep the v1 view, not fall
+        // through to the generic `VersionedTransaction` path.
+        let parsed = parse_raw_transaction(v1_transfer_tx()).expect("v1 transaction parses");
+        assert_eq!(parsed.format, TransactionFormat::V1);
+        let v1 = parsed.v1.as_ref().expect("v1 parse is retained");
+        assert_eq!(v1.config.priority_fee, Some(5_000));
     }
 }

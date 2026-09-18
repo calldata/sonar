@@ -496,7 +496,7 @@ enum LoadPriority {
 
 fn account_priority(account: &AccountSharedData) -> LoadPriority {
     if *account.owner() == bpf_loader_upgradeable::id() {
-        if let Ok(state) = bincode::deserialize::<UpgradeableLoaderState>(account.data()) {
+        if let Ok(state) = wincode::deserialize::<UpgradeableLoaderState>(account.data()) {
             return match state {
                 UpgradeableLoaderState::ProgramData { .. } => LoadPriority::ProgramData,
                 UpgradeableLoaderState::Program { .. } => LoadPriority::Program,

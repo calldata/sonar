@@ -4,8 +4,9 @@
 //! mint and token account data, including Token-2022 extensions.
 
 use serde_json::{Value, json};
-#[cfg(test)]
+use solana_nullable::MaybeNull;
 use solana_pubkey::Pubkey;
+use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
 use spl_token::solana_program::program_option::COption;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::{Account as LegacyTokenAccount, Mint as LegacyMint};
@@ -473,22 +474,19 @@ fn coption_u64_to_json(opt: &COption<u64>) -> Value {
     }
 }
 
-fn pod_option_pubkey_to_string(opt: &spl_pod::optional_keys::OptionalNonZeroPubkey) -> Value {
-    // OptionalNonZeroPubkey.0 is a solana_pubkey::Pubkey
-    // If all bytes are zero, it represents None
-    let pk: solana_pubkey::Pubkey = opt.0;
-    if pk == solana_pubkey::Pubkey::default() { Value::Null } else { Value::String(pk.to_string()) }
+fn pod_option_pubkey_to_string(opt: &MaybeNull<Pubkey>) -> Value {
+    // An all-zero pubkey is the `None` sentinel for these Pod fields.
+    match opt.get() {
+        Some(pk) => Value::String(pk.to_string()),
+        None => Value::Null,
+    }
 }
 
-/// Render an `OptionalNonZeroElGamalPubkey` as a base64 string, or null when
-/// unset (all-zero, which encodes `None`).
-fn pod_option_elgamal_to_string(
-    opt: &spl_pod::optional_keys::OptionalNonZeroElGamalPubkey,
-) -> Value {
-    // The `From<OptionalNonZeroElGamalPubkey> for Option<PodElGamalPubkey>` impl
-    // maps the all-zero sentinel to `None`; `PodElGamalPubkey` Displays as base64.
-    let maybe: Option<solana_zk_sdk::encryption::pod::elgamal::PodElGamalPubkey> = (*opt).into();
-    match maybe {
+/// Render an optional ElGamal pubkey as a base64 string, or null when unset
+/// (all-zero, which encodes `None`).
+fn pod_option_elgamal_to_string(opt: &MaybeNull<PodElGamalPubkey>) -> Value {
+    // `PodElGamalPubkey` Displays as base64.
+    match opt.get() {
         Some(pk) => Value::String(pk.to_string()),
         None => Value::Null,
     }
@@ -706,8 +704,8 @@ mod tests {
 
     #[test]
     fn test_decode_token2022_mint_confidential_transfer() {
+        use solana_nullable::MaybeNull;
         use solana_pubkey::Pubkey as SolanaPubkey;
-        use spl_pod::optional_keys::OptionalNonZeroPubkey;
         use spl_token_2022::extension::{BaseStateWithExtensionsMut, StateWithExtensionsMut};
 
         let ct_authority = SolanaPubkey::new_unique();
@@ -722,7 +720,7 @@ mod tests {
             StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut data).unwrap();
 
         let ext = state.init_extension::<ConfidentialTransferMint>(true).unwrap();
-        ext.authority = OptionalNonZeroPubkey::try_from(Some(ct_authority)).unwrap();
+        ext.authority = MaybeNull::from(ct_authority);
         ext.auto_approve_new_accounts = true.into();
         // auditor_elgamal_pubkey left at its all-zero default (encodes None).
 
@@ -759,8 +757,8 @@ mod tests {
 
     #[test]
     fn test_decode_token2022_mint_confidential_fee_and_mint_burn() {
+        use solana_nullable::MaybeNull;
         use solana_pubkey::Pubkey as SolanaPubkey;
-        use spl_pod::optional_keys::OptionalNonZeroPubkey;
         use spl_token_2022::extension::{BaseStateWithExtensionsMut, StateWithExtensionsMut};
 
         let fee_authority = SolanaPubkey::new_unique();
@@ -775,7 +773,7 @@ mod tests {
             StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut data).unwrap();
 
         let fee = state.init_extension::<ConfidentialTransferFeeConfig>(true).unwrap();
-        fee.authority = OptionalNonZeroPubkey::try_from(Some(fee_authority)).unwrap();
+        fee.authority = MaybeNull::from(fee_authority);
         fee.harvest_to_mint_enabled = true.into();
 
         state.init_extension::<ConfidentialMintBurn>(true).unwrap();

@@ -3,6 +3,7 @@
 A CLI for local Solana transaction simulation (LiteSVM) plus developer utilities.
 
 - Simulate transactions locally without deploying programs (raw tx, signature, bundle, or raw instructions)
+- Parse legacy, v0, and v1 (SIMD-0385) transaction formats
 - Override programs/accounts, fund SOL or tokens, patch data
 - Store accounts once, replay without hitting RPC
 - Serialize/deserialize Borsh with a type descriptor DSL
@@ -55,6 +56,7 @@ sonar account <PUBKEY> --rpc-url https://api.mainnet-beta.solana.com
 ## Documentation
 
 - [Simulate & Decode](docs/simulate.md): full usage, overrides, funding, patching, cache
+- [Transaction Formats](docs/transaction-formats.md): legacy / v0 / v1 parsing, v1 wire format and config
 - [Account, PDA, Program ELF, IDL, Send](docs/commands.md): per-command reference
 - [Borsh](docs/borsh.md): serialization/deserialization with type descriptor DSL
 - [Convert](docs/convert.md): format conversion reference

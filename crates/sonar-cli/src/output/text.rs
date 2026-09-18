@@ -131,6 +131,14 @@ pub(super) fn render_transaction_section_text(
         None => String::new(),
     };
 
+    if let Some(config) = &transaction.v1_config {
+        write_section_title(w, &format!("Transaction Config (v1){}", tx_suffix));
+        let _ = writeln!(w, "{}Mask: {}", INDENT_L1, config.config_mask);
+        let _ = writeln!(w, "{}Requests: {}", INDENT_L1, config.summary());
+        let _ = writeln!(w, "{}Effective: {}", INDENT_L1, config.effective_summary());
+        let _ = writeln!(w);
+    }
+
     write_section_title(w, &format!("Decoded Instructions{}", tx_suffix));
     render_instruction_details_text(transaction, resolved, show_ix_data, w);
 
@@ -260,14 +268,31 @@ fn render_summary_header(
         transaction.size_bytes
     );
     write_section_title(w, &result_text);
+
+    // v1 carries its compute budget requests in the transaction header rather
+    // than in `ComputeBudget` instructions, so surface them alongside the
+    // summary instead of leaving them invisible in text output.
+    if let Some(config) = &transaction.v1_config {
+        let _ = writeln!(w, "{}v1 config: {}", INDENT_L1, config.summary());
+    }
 }
 
 /// Compute-unit limit assumed when a transaction does not set one explicitly,
 /// used only to render the "CU used / limit" percentage.
 const DEFAULT_COMPUTE_UNIT_LIMIT: u64 = 200_000;
 
+/// Compute-unit limit used to render the "CU used / limit" percentage.
+///
+/// v1 carries the limit in its header config mask and the SIMD says
+/// `ComputeBudget` instructions do not configure it, so the config is the only
+/// source for that format. An absent request is a zero limit rather than the
+/// legacy default, hence the effective value — the denominator has to agree with
+/// the "Effective" line of the config block.
 fn extract_compute_unit_limit(transaction: &TransactionSection) -> Option<u64> {
     use sonar_idl::IdlValue;
+    if let Some(config) = transaction.v1_config.as_ref() {
+        return Some(u64::from(config.effective_compute_unit_limit));
+    }
     for ix in &transaction.instructions {
         if let Some(parsed) = &ix.parsed {
             if parsed.name == "SetComputeUnitLimit" {

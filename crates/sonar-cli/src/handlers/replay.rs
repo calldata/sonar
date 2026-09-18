@@ -2,14 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
-use solana_commitment_config::CommitmentConfig;
 use solana_message::compiled_instruction::CompiledInstruction;
 use solana_message::inner_instruction::{InnerInstruction, InnerInstructionsList};
 use solana_pubkey::Pubkey;
 use solana_transaction_status_client_types::option_serializer::OptionSerializer;
 use solana_transaction_status_client_types::{
-    UiCompiledInstruction, UiInnerInstructions, UiInstruction, UiTransactionEncoding,
-    UiTransactionStatusMeta, UiTransactionTokenBalance,
+    UiCompiledInstruction, UiInnerInstructions, UiInstruction, UiTransactionStatusMeta,
+    UiTransactionTokenBalance,
 };
 use sonar_sim::{
     ExecutionResult, ExecutionStatus, ResolvedAccounts, ResolvedLookup, ReturnData,
@@ -20,9 +19,10 @@ use solana_account::AccountSharedData;
 
 use crate::cli::ReplayArgs;
 use crate::core::account_loader;
-use crate::core::rpc_client::{GetTransactionConfig, RpcClient};
+use crate::core::rpc_client::RpcClient;
 use crate::core::transaction::{
-    ParsedTransaction, encode_transaction_to_base64, parse_raw_transaction,
+    ParsedTransaction, fetch_transaction_response, fetched_transaction_wire_base64,
+    parse_raw_transaction,
 };
 use crate::output::{self, BalanceChangeOptions, LogDisplayOptions, RenderOptions};
 use crate::parsers::instruction::ParserRegistry;
@@ -36,26 +36,15 @@ pub(crate) fn handle(args: ReplayArgs, json: bool) -> Result<()> {
     let mut parser_registry = ParserRegistry::new(idl_dir);
 
     let signature = args.signature.trim().to_string();
-    let parsed_sig =
-        signature.parse().map_err(|_| anyhow!("Invalid transaction signature: {}", signature))?;
+    signature
+        .parse::<solana_signature::Signature>()
+        .map_err(|_| anyhow!("Invalid transaction signature: {}", signature))?;
 
     progress.set_message("Fetching transaction from RPC...");
     let client = RpcClient::new(&rpc_url);
-    let config = GetTransactionConfig {
-        encoding: UiTransactionEncoding::Base64,
-        commitment: CommitmentConfig::confirmed(),
-        max_supported_transaction_version: Some(0),
-    };
-    let response = client.get_transaction_with_config(&parsed_sig, config).map_err(|e| {
-        log::error!("RPC get_transaction error: {:?}", e);
-        anyhow!("Failed to fetch transaction for signature: {}. Error: {}", signature, e)
-    })?;
-
-    let tx = response
-        .transaction
-        .decode()
-        .ok_or_else(|| anyhow!("Failed to decode transaction from RPC response"))?;
-    let raw_base64 = encode_transaction_to_base64(&tx)?;
+    let response = fetch_transaction_response(&rpc_url, &signature)?;
+    // Wire bytes are used as returned: re-encoding would drop the v1 layout.
+    let raw_base64 = fetched_transaction_wire_base64(&response.transaction)?;
 
     let meta = response.meta;
     let inner_instructions = meta

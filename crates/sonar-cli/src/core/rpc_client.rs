@@ -1,14 +1,13 @@
 use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use anyhow::{Result, anyhow};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use solana_account::Account;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status_client_types::{
     EncodedTransaction, TransactionStatus, UiTransactionEncoding, UiTransactionStatusMeta,
 };
@@ -119,13 +118,18 @@ impl RpcClient {
         Ok(RpcResponse { value })
     }
 
+    /// Submit a transaction's wire bytes.
+    ///
+    /// The caller owns serialization because the wire layout is format-specific:
+    /// legacy/v0 use the `wincode` (frozen bincode 1.3) layout of
+    /// [`VersionedTransaction`](solana_transaction::versioned::VersionedTransaction),
+    /// while v1 writes its signature array as a trailing fixed-length array. The
+    /// base64 the RPC asks for is an encoding detail of this call, not of the caller.
     pub fn send_transaction_with_config(
         &self,
-        transaction: &VersionedTransaction,
+        tx_bytes: &[u8],
         config: SendTransactionConfig,
     ) -> Result<Signature> {
-        let tx_bytes =
-            bincode::serialize(transaction).context("Failed to serialize transaction")?;
         let mut opts = serde_json::json!({
             "encoding": "base64",
             "skipPreflight": config.skip_preflight,
@@ -134,8 +138,8 @@ impl RpcClient {
             opts["preflightCommitment"] =
                 serde_json::Value::String(commitment_str(commitment).into());
         }
-        let sig_str: String =
-            self.call("sendTransaction", serde_json::json!([BASE64.encode(&tx_bytes), opts]))?;
+        let tx_base64 = BASE64_STANDARD.encode(tx_bytes);
+        let sig_str: String = self.call("sendTransaction", serde_json::json!([tx_base64, opts]))?;
         Signature::from_str(&sig_str).map_err(|e| anyhow!("Invalid signature: {e}"))
     }
 

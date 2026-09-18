@@ -1,7 +1,9 @@
 pub(crate) use sonar_sim::build_lookup_locations;
-pub use sonar_sim::{LookupLocation, MessageAccountPlan, RawTransactionEncoding};
+pub use sonar_sim::{
+    LookupLocation, MessageAccountPlan, RawTransactionEncoding, TransactionFormat, V1Transaction,
+};
 
-use crate::core::rpc_client::{GetTransactionConfig, RpcClient};
+use crate::core::rpc_client::{GetTransactionConfig, RpcClient, RpcTransactionResponse};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -13,11 +15,16 @@ use solana_message::inner_instruction::InnerInstructionsList;
 use solana_message::{Message, VersionedMessage};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::versioned::{TransactionVersion, VersionedTransaction};
-use solana_transaction_status_client_types::UiTransactionEncoding;
+use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction_status_client_types::{
+    EncodedTransaction, TransactionBinaryEncoding, UiTransactionEncoding,
+};
 use std::str::FromStr;
 
 use crate::utils::progress::Progress;
+
+/// No reserved addresses: account summaries report the message's own write locks.
+const NO_RESERVED_ADDRESSES: Option<&std::collections::HashSet<Pubkey>> = None;
 
 // ---------------------------------------------------------------------------
 // CLI-specific ParsedTransaction (adds `summary` field not present in sonar-sim)
@@ -26,10 +33,15 @@ use crate::utils::progress::Progress;
 #[derive(Debug, Clone)]
 pub struct ParsedTransaction {
     pub encoding: RawTransactionEncoding,
-    pub version: TransactionVersion,
+    /// Wire format, including v1 (SIMD-0385).
+    pub format: TransactionFormat,
+    /// Executable form. Use [`ParsedTransaction::to_wire_bytes`] for wire bytes:
+    /// the encoding is format-specific.
     pub transaction: VersionedTransaction,
     pub summary: TransactionSummary,
     pub account_plan: MessageAccountPlan,
+    /// Full v1 parse, present exactly when `format` is [`TransactionFormat::V1`].
+    pub v1: Option<V1Transaction>,
 }
 
 impl ParsedTransaction {
@@ -37,16 +49,34 @@ impl ParsedTransaction {
         transaction: VersionedTransaction,
         encoding: RawTransactionEncoding,
     ) -> Self {
-        let version = transaction.version();
+        let format = TransactionFormat::from(transaction.version());
         let account_plan = MessageAccountPlan::from_transaction(&transaction);
         let summary = TransactionSummary::from_transaction(&transaction, &account_plan, Vec::new());
-        Self { encoding, version, transaction, summary, account_plan }
+        Self { encoding, format, transaction, summary, account_plan, v1: None }
     }
 
     /// Build the CLI parsed form (with display summary) from a `sonar-sim`
     /// parsed transaction produced by a pipeline stage.
     pub fn from_sim(parsed: &sonar_sim::ParsedTransaction) -> Self {
-        Self::from_versioned(parsed.transaction.clone(), parsed.encoding)
+        let mut cli = Self::from_versioned(parsed.transaction.clone(), parsed.encoding);
+        cli.format = parsed.format;
+        cli.v1 = parsed.v1.clone();
+        cli
+    }
+
+    /// Serialize back to the wire format the input used.
+    ///
+    /// The rule lives in sonar-sim ([`sonar_sim::wire_bytes`]) so that the two
+    /// parsed-transaction types cannot disagree about which serializer owns which
+    /// format.
+    pub fn to_wire_bytes(&self) -> Result<Vec<u8>> {
+        Ok(sonar_sim::wire_bytes(&self.transaction, self.v1.as_ref())?)
+    }
+
+    /// Base64 of [`to_wire_bytes`](Self::to_wire_bytes): the canonical encoding
+    /// used for submittable bytes, caching, and pipeline re-parsing.
+    pub fn to_wire_base64(&self) -> Result<String> {
+        Ok(BASE64_STANDARD.encode(self.to_wire_bytes()?))
     }
 }
 
@@ -302,11 +332,6 @@ pub fn is_transaction_signature(s: &str) -> bool {
     Signature::from_str(trimmed).is_ok()
 }
 
-pub fn encode_transaction_to_base64(tx: &VersionedTransaction) -> Result<String> {
-    let serialized = bincode::serialize(tx).context("Failed to serialize transaction")?;
-    Ok(BASE64_STANDARD.encode(serialized))
-}
-
 /// Whether a raw instruction value should be parsed as JSON rather than the
 /// named-field DSL. JSON inputs lead with `{` (object) or `[` (array) after
 /// optional whitespace; the DSL always leads with a `name=` field.
@@ -424,11 +449,17 @@ pub fn build_transaction_from_instructions(
     Ok(ParsedTransaction::from_versioned(transaction, RawTransactionEncoding::Base64))
 }
 
-pub fn fetch_transaction_from_rpc(
+/// Fetch a confirmed transaction from RPC.
+///
+/// A newer transaction format is rejected by the node unless the client
+/// advertises support for it (`-32015: Transaction version (1) is not supported
+/// by the requesting client`), so the request asks for the highest version Sonar
+/// can parse. The wire bytes come back untouched — see
+/// [`fetched_transaction_wire_base64`].
+pub fn fetch_transaction_response(
     rpc_url: &str,
     signature: &str,
-    _progress: Option<&Progress>,
-) -> Result<String> {
+) -> Result<RpcTransactionResponse> {
     let parsed_sig =
         signature.parse().with_context(|| format!("Invalid signature format: {}", signature))?;
 
@@ -436,19 +467,57 @@ pub fn fetch_transaction_from_rpc(
     let config = GetTransactionConfig {
         encoding: UiTransactionEncoding::Base64,
         commitment: CommitmentConfig::confirmed(),
-        max_supported_transaction_version: Some(0),
+        max_supported_transaction_version: Some(1),
     };
 
-    let response = client.get_transaction_with_config(&parsed_sig, config).map_err(|e| {
+    client.get_transaction_with_config(&parsed_sig, config).map_err(|e| {
         log::error!("RPC get_transaction error: {:?}", e);
         anyhow!("Failed to fetch transaction for signature: {}. Error: {}", signature, e)
-    })?;
+    })
+}
 
-    let tx = response
-        .transaction
-        .decode()
-        .ok_or_else(|| anyhow!("Failed to decode transaction from RPC response"))?;
-    encode_transaction_to_base64(&tx)
+/// Base64 wire bytes of a transaction returned by `getTransaction`.
+///
+/// A binary response already carries exactly the bytes the cluster accepted, so
+/// it is passed through rather than decoded and re-encoded: the bytes are what
+/// Sonar parses, caches, and re-sends, and re-encoding could only lose
+/// format-specific detail (the v1 signature array, for one).
+pub fn fetched_transaction_wire_base64(transaction: &EncodedTransaction) -> Result<String> {
+    match transaction {
+        EncodedTransaction::Binary(blob, TransactionBinaryEncoding::Base64) => Ok(blob.clone()),
+        EncodedTransaction::LegacyBinary(blob) => {
+            let bytes = bs58::decode(blob)
+                .into_vec()
+                .context("Failed to decode Base58 transaction from RPC response")?;
+            Ok(BASE64_STANDARD.encode(bytes))
+        }
+        EncodedTransaction::Binary(blob, TransactionBinaryEncoding::Base58) => {
+            let bytes = bs58::decode(blob)
+                .into_vec()
+                .context("Failed to decode Base58 transaction from RPC response")?;
+            Ok(BASE64_STANDARD.encode(bytes))
+        }
+        // A parsed response carries no wire bytes: `EncodedTransaction::decode`
+        // returns `None` for both of these variants. Erroring beats reconstructing
+        // bytes from the parsed form, which would not preserve the encoding the
+        // cluster used. Sonar requests `Binary` + Base64, so this means the node
+        // answered with a shape it was not asked for — telling the user to re-fetch
+        // with binary encoding would be advice they already followed.
+        EncodedTransaction::Json(_) | EncodedTransaction::Accounts(_) => Err(anyhow!(
+            "the node returned a parsed (JSON) transaction despite the binary request, and a \
+             parsed transaction carries no raw wire bytes to reuse; retry, or fetch the \
+             transaction with a node that honors the requested encoding"
+        )),
+    }
+}
+
+pub fn fetch_transaction_from_rpc(
+    rpc_url: &str,
+    signature: &str,
+    _progress: Option<&Progress>,
+) -> Result<String> {
+    let response = fetch_transaction_response(rpc_url, signature)?;
+    fetched_transaction_wire_base64(&response.transaction)
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +526,7 @@ pub fn fetch_transaction_from_rpc(
 
 pub fn parse_raw_transaction(raw: &str) -> Result<ParsedTransaction> {
     let sim_parsed = sonar_sim::parse_raw_transaction(raw)?;
-    Ok(ParsedTransaction::from_versioned(sim_parsed.transaction, sim_parsed.encoding))
+    Ok(ParsedTransaction::from_sim(&sim_parsed))
 }
 
 impl TxInputResolver {
@@ -472,7 +541,7 @@ impl TxInputResolver {
         match parse_raw_transaction(input) {
             Ok(parsed_tx) => Ok(ResolvedTxInput {
                 original_input: input.to_string(),
-                raw_tx_base64: encode_transaction_to_base64(&parsed_tx.transaction)?,
+                raw_tx_base64: parsed_tx.to_wire_base64()?,
                 parsed_tx,
                 source: TxResolveSource::RawInput,
             }),
@@ -582,7 +651,8 @@ impl TransactionSummary {
                 index,
                 pubkey: key.to_string(),
                 signer: message.is_signer(index),
-                writable: message.is_maybe_writable(index, None),
+                writable: message
+                    .is_maybe_writable_with_reserved_addresses(index, NO_RESERVED_ADDRESSES),
             })
             .collect();
 
@@ -647,7 +717,8 @@ pub(crate) fn classify_account_reference(
             index,
             pubkey: Some(plan.static_accounts[index].to_string()),
             signer: message.is_signer(index),
-            writable: message.is_maybe_writable(index, None),
+            writable: message
+                .is_maybe_writable_with_reserved_addresses(index, NO_RESERVED_ADDRESSES),
             source: AccountSourceSummary::Static,
         }
     } else {
@@ -684,11 +755,12 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use solana_hash::Hash;
     use solana_keypair::Keypair;
-    use solana_message::Message;
+    use solana_message::{Message, MessageHeader};
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
     use solana_transaction::Transaction;
+    use solana_transaction_status_client_types::{UiMessage, UiRawMessage, UiTransaction};
 
     fn sample_transaction() -> (VersionedTransaction, Pubkey) {
         let payer = Keypair::new();
@@ -703,7 +775,7 @@ mod tests {
     #[test]
     fn parse_base64_transaction() {
         let (versioned, payer) = sample_transaction();
-        let bytes = bincode::serialize(&versioned).unwrap();
+        let bytes = wincode::serialize(&versioned).unwrap();
         let base64 = BASE64_STANDARD.encode(&bytes);
 
         let parsed = parse_raw_transaction(&base64).expect("parse base64");
@@ -717,7 +789,7 @@ mod tests {
     #[test]
     fn parse_base58_transaction() {
         let (versioned, _) = sample_transaction();
-        let bytes = bincode::serialize(&versioned).unwrap();
+        let bytes = wincode::serialize(&versioned).unwrap();
         let base58 = bs58::encode(&bytes).into_string();
 
         let parsed = parse_raw_transaction(&base58).expect("parse base58");
@@ -768,7 +840,7 @@ mod tests {
     #[test]
     fn tx_input_resolver_prefers_cache_for_signature() {
         let (versioned, _) = sample_transaction();
-        let bytes = bincode::serialize(&versioned).unwrap();
+        let bytes = wincode::serialize(&versioned).unwrap();
         let raw_base64 = BASE64_STANDARD.encode(&bytes);
         let signature = "3PtGYH77LhhQqTXP4SmDVJ85hmDieWsgXCUbn14v7gYyVYPjZzygUQhTk3bSTYnfA48vCM1rmWY7zWL3j1EVKmEy";
 
@@ -811,7 +883,7 @@ mod tests {
     #[test]
     fn tx_input_resolver_marks_raw_source() {
         let (versioned, _) = sample_transaction();
-        let bytes = bincode::serialize(&versioned).unwrap();
+        let bytes = wincode::serialize(&versioned).unwrap();
         let raw_base64 = BASE64_STANDARD.encode(&bytes);
 
         let resolver = TxInputResolver::new(
@@ -1033,6 +1105,120 @@ mod tests {
         let raw = format!("program={program} data=00 encoding=base32");
         let err = parse_instruction_input_dsl(&raw).expect_err("unknown encoding rejected");
         assert!(format!("{err:#}").contains("base32"), "got: {err:#}");
+    }
+
+    /// One-signature v1 transaction (reference fixture A): four configured
+    /// fields, and signatures written as a trailing fixed-length array.
+    fn v1_fixture() -> &'static str {
+        // The reference-implementation fixture, shared by every crate that
+        // exercises the v1 wire format (the file keeps a trailing newline).
+        include_str!("../../../sonar-sim/tests/fixtures/v1_transfer.b64").trim()
+    }
+
+    #[test]
+    fn fetched_wire_bytes_pass_through_unmodified() {
+        // `getTransaction` answers with the bytes the cluster accepted, and those
+        // are forwarded untouched: no decode/re-encode step sits between RPC and
+        // the parser that has to recognize the format.
+        let v1 =
+            EncodedTransaction::Binary(v1_fixture().to_string(), TransactionBinaryEncoding::Base64);
+        assert_eq!(fetched_transaction_wire_base64(&v1).unwrap(), v1_fixture());
+    }
+
+    /// A parsed v1 transaction writes the bytes it arrived as: the parse is the
+    /// single authority for the v1 layout, in both directions.
+    #[test]
+    fn decoded_v1_transactions_reencode_byte_for_byte() {
+        let decoded = parse_raw_transaction(v1_fixture()).expect("v1 fixture parses");
+        assert_eq!(decoded.format, TransactionFormat::V1);
+        let wire = decoded.to_wire_bytes().expect("v1 re-serializes");
+        assert_eq!(BASE64_STANDARD.encode(wire), v1_fixture());
+    }
+
+    /// The wire serializer must write the v1 layout, not the serde layout.
+    ///
+    /// `bincode`-serializing a v1 transaction writes a `short_vec` signature count
+    /// and an enum-tagged message; feeding those bytes back to the cluster (or to
+    /// `send`) would be rejected, so the two encodings are compared here on
+    /// purpose. `wincode` is what [`sonar_sim::wire_bytes`] uses for the non-v1
+    /// formats, and it happens to reproduce the v1 layout too. If this stops
+    /// compiling, upstream dropped the serde path and the note in
+    /// [`sonar_sim::wire_bytes`] should be revisited.
+    #[test]
+    fn wire_bytes_use_the_v1_layout() {
+        let parsed = parse_raw_transaction(v1_fixture()).expect("v1 fixture parses");
+        let wire = BASE64_STANDARD.decode(v1_fixture()).expect("fixture is base64");
+
+        assert_eq!(wincode::serialize(&parsed.transaction).unwrap(), wire);
+        assert_eq!(parsed.to_wire_base64().unwrap(), v1_fixture());
+        assert_eq!(wire[0], 0x81, "v1 wire bytes lead with the version byte");
+        let serde_bytes = bincode::serialize(&parsed.transaction).unwrap();
+        assert_ne!(serde_bytes, wire, "the serde encoding is not the v1 wire layout");
+        assert_eq!(serde_bytes[0], 0x01, "serde leads with a short_vec signature count");
+    }
+
+    /// `wincode` has to reproduce the legacy/v0 layout exactly, because it is the
+    /// one serializer every format now goes through.
+    #[test]
+    fn wincode_reproduces_the_legacy_and_v0_wire_layout() {
+        let (legacy, payer) = sample_transaction();
+        let v0 = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V0(solana_message::v0::Message {
+                header: solana_message::MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                account_keys: vec![payer, Pubkey::new_unique()],
+                recent_blockhash: Hash::new_unique(),
+                instructions: Vec::new(),
+                address_table_lookups: Vec::new(),
+            }),
+        };
+
+        for tx in [legacy, v0] {
+            assert_eq!(
+                wincode::serialize(&tx).unwrap(),
+                bincode::serialize(&tx).unwrap(),
+                "legacy/v0 wire bytes must match the frozen bincode layout"
+            );
+        }
+    }
+
+    /// A parsed response carries no wire bytes, and the error has to say so
+    /// instead of reconstructing bytes from a form that lost the encoding.
+    #[test]
+    fn parsed_json_transactions_have_no_wire_bytes() {
+        let json = EncodedTransaction::Json(UiTransaction {
+            signatures: vec![Signature::default().to_string()],
+            message: UiMessage::Raw(UiRawMessage {
+                header: MessageHeader::default(),
+                account_keys: Vec::new(),
+                recent_blockhash: Hash::default().to_string(),
+                instructions: Vec::new(),
+                address_table_lookups: None,
+                transaction_config: None,
+            }),
+        });
+
+        let err = fetched_transaction_wire_base64(&json).expect_err("json has no wire bytes");
+        // Exact text on purpose: a joined multi-line literal once smuggled a run of
+        // spaces into this user-facing message.
+        assert_eq!(
+            err.to_string(),
+            "the node returned a parsed (JSON) transaction despite the binary request, and a \
+             parsed transaction carries no raw wire bytes to reuse; retry, or fetch the \
+             transaction with a node that honors the requested encoding"
+        );
+    }
+
+    #[test]
+    fn fetched_base58_wire_bytes_are_reencoded_losslessly() {
+        let raw = BASE64_STANDARD.decode(v1_fixture()).expect("fixture is base64");
+        let legacy = EncodedTransaction::LegacyBinary(bs58::encode(&raw).into_string());
+        let encoded = fetched_transaction_wire_base64(&legacy).expect("base58 re-encodes");
+        assert_eq!(BASE64_STANDARD.decode(encoded).expect("valid base64"), raw);
     }
 
     #[test]

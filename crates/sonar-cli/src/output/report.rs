@@ -6,9 +6,11 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Serialize, Serializer};
 use solana_account::AccountSharedData;
 use solana_pubkey::Pubkey;
-use solana_transaction::versioned::TransactionVersion;
 
-use crate::core::transaction::{AccountReferenceSummary, AccountSourceSummary, ParsedTransaction};
+use crate::core::transaction::{
+    AccountReferenceSummary, AccountSourceSummary, ParsedTransaction, V1Transaction,
+};
+use crate::output::fmt::format_with_commas;
 use crate::parsers::instruction::{
     ParsedInstruction, ParserRegistry, anchor_idl::is_anchor_cpi_event,
 };
@@ -393,8 +395,136 @@ pub(super) struct TransactionSection {
     pub(super) static_accounts: Vec<AccountEntry>,
     pub(super) lookups: Vec<LookupSection>,
     pub(super) instructions: Vec<InstructionSection>,
+    /// Config requests carried in the v1 header instead of by `ComputeBudget`
+    /// instructions; absent for legacy/v0 transactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) v1_config: Option<V1ConfigSection>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) verify_signatures: bool,
+}
+
+/// v1 config requests as rendered, including the effective values the SIMD
+/// defines for absent fields.
+#[derive(Serialize)]
+pub(super) struct V1ConfigSection {
+    pub(super) config_mask: String,
+    pub(super) priority_fee: Option<u64>,
+    pub(super) compute_unit_limit: Option<u32>,
+    pub(super) loaded_accounts_data_size_limit: Option<u32>,
+    pub(super) heap_size: Option<u32>,
+    pub(super) effective_compute_unit_limit: u32,
+    pub(super) effective_loaded_accounts_data_size_limit: u32,
+    pub(super) effective_heap_size: u32,
+}
+
+impl V1ConfigSection {
+    fn from_v1(v1: &V1Transaction) -> Self {
+        Self {
+            config_mask: format!("0x{:08x}", v1.config_mask()),
+            priority_fee: v1.config.priority_fee,
+            compute_unit_limit: v1.config.compute_unit_limit,
+            loaded_accounts_data_size_limit: v1.config.loaded_accounts_data_size_limit,
+            heap_size: v1.config.heap_size,
+            effective_compute_unit_limit: v1.config.effective_compute_unit_limit(),
+            effective_loaded_accounts_data_size_limit: v1
+                .config
+                .effective_loaded_accounts_data_size_limit(),
+            effective_heap_size: v1.config.effective_heap_size(),
+        }
+    }
+
+    /// One-line human summary of the requests that are actually present.
+    pub(super) fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(fee) = self.priority_fee {
+            parts.push(format!("priority fee: {} lamports", format_with_commas(fee)));
+        }
+        if let Some(limit) = self.compute_unit_limit {
+            parts.push(format!("compute unit limit: {}", format_with_commas(u64::from(limit))));
+        }
+        if let Some(limit) = self.loaded_accounts_data_size_limit {
+            parts.push(format!(
+                "loaded accounts data size limit: {} bytes",
+                format_with_commas(u64::from(limit))
+            ));
+        }
+        if let Some(heap) = self.heap_size {
+            parts.push(format!("heap size: {} bytes", format_with_commas(u64::from(heap))));
+        }
+        if parts.is_empty() { "no config requests".to_string() } else { parts.join(", ") }
+    }
+
+    /// One-line summary of the values the SIMD defines for absent fields.
+    ///
+    /// Formatted next to [`summary`](Self::summary) so both lines of the text
+    /// report group digits the same way.
+    pub(super) fn effective_summary(&self) -> String {
+        format!(
+            "compute unit limit {}, loaded accounts data size limit {} bytes, heap size {} bytes",
+            format_with_commas(u64::from(self.effective_compute_unit_limit)),
+            format_with_commas(u64::from(self.effective_loaded_accounts_data_size_limit)),
+            format_with_commas(u64::from(self.effective_heap_size))
+        )
+    }
+}
+
+#[cfg(test)]
+mod v1_config_section_tests {
+    use super::V1ConfigSection;
+
+    /// Mask `0x0f` on the mainnet reference transaction.
+    fn mainnet_config() -> V1ConfigSection {
+        V1ConfigSection {
+            config_mask: "0x0000000f".to_string(),
+            priority_fee: Some(176),
+            compute_unit_limit: Some(84_501),
+            loaded_accounts_data_size_limit: Some(67_108_864),
+            heap_size: None,
+            effective_compute_unit_limit: 84_501,
+            effective_loaded_accounts_data_size_limit: 67_108_864,
+            effective_heap_size: 32_768,
+        }
+    }
+
+    #[test]
+    fn summary_lists_only_the_requested_fields() {
+        let config = mainnet_config();
+        assert_eq!(
+            config.summary(),
+            "priority fee: 176 lamports, compute unit limit: 84,501, \
+             loaded accounts data size limit: 67,108,864 bytes"
+        );
+    }
+
+    #[test]
+    fn effective_summary_includes_the_documented_defaults() {
+        let config = mainnet_config();
+        assert_eq!(
+            config.effective_summary(),
+            "compute unit limit 84,501, loaded accounts data size limit 67,108,864 bytes, \
+             heap size 32,768 bytes"
+        );
+    }
+
+    #[test]
+    fn summaries_of_an_empty_mask_report_no_requests() {
+        let config = V1ConfigSection {
+            config_mask: "0x00000000".to_string(),
+            priority_fee: None,
+            compute_unit_limit: None,
+            loaded_accounts_data_size_limit: None,
+            heap_size: None,
+            effective_compute_unit_limit: 0,
+            effective_loaded_accounts_data_size_limit: 0,
+            effective_heap_size: 32_768,
+        };
+        assert_eq!(config.summary(), "no config requests");
+        // Zero-byte limits are the minimum the SIMD defines, not a fallback.
+        assert_eq!(
+            config.effective_summary(),
+            "compute unit limit 0, loaded accounts data size limit 0 bytes, heap size 32,768 bytes"
+        );
+    }
 }
 
 impl TransactionSection {
@@ -411,10 +541,7 @@ impl TransactionSection {
         }
         .to_string();
 
-        let version = match parsed.version {
-            TransactionVersion::Legacy(_) => "legacy".to_string(),
-            TransactionVersion::Number(v) => format!("v{v}"),
-        };
+        let version = parsed.format.label().to_string();
 
         let static_accounts = parsed
             .summary
@@ -444,8 +571,10 @@ impl TransactionSection {
             .collect();
 
         let lookups = resolved.lookups.iter().map(LookupSection::from_lookup).collect();
-        let size_bytes =
-            bincode::serialize(&parsed.transaction).map(|serialized| serialized.len()).unwrap_or(0);
+        // Serialize the transaction as it arrived on the wire, so a v1
+        // transaction reports its v1 size rather than its lowering's size.
+        let size_bytes = parsed.to_wire_bytes().map(|bytes| bytes.len()).unwrap_or(0);
+        let v1_config = parsed.v1.as_ref().map(V1ConfigSection::from_v1);
 
         Self {
             encoding,
@@ -456,6 +585,7 @@ impl TransactionSection {
             static_accounts,
             lookups,
             instructions,
+            v1_config,
             verify_signatures,
         }
     }

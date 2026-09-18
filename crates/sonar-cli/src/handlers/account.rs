@@ -288,12 +288,25 @@ fn decode_rent_sysvar(
         return None;
     }
     let rent = bincode::deserialize::<solana_rent::Rent>(account.data.as_slice()).ok()?;
-    let data_json = serde_json::json!({
-        "lamportsPerByteYear": rent.lamports_per_byte_year,
-        "exemptionThreshold": rent.exemption_threshold,
+    Some((wrap_account_data_output(account, rent_sysvar_json(&rent)), "Sysvar Rent".into(), None))
+}
+
+/// The rent sysvar's JSON shape, matching what `getAccountInfo` reports.
+///
+/// `exemption_threshold` and `burn_percent` are deprecated upstream because rent
+/// collection is gone, but they are still part of the sysvar's on-chain layout,
+/// so this decoder keeps reporting them. Upstream stores the threshold as the
+/// raw eight bytes that used to be an `f64`; decoding them back to the number
+/// keeps the published output unchanged.
+#[allow(deprecated)]
+fn rent_sysvar_json(rent: &solana_rent::Rent) -> Value {
+    serde_json::json!({
+        // Renamed upstream from `lamports_per_byte_year`; the value and the JSON
+        // key stay as published.
+        "lamportsPerByteYear": rent.lamports_per_byte,
+        "exemptionThreshold": f64::from_le_bytes(rent.exemption_threshold),
         "burnPercent": rent.burn_percent,
-    });
-    Some((wrap_account_data_output(account, data_json), "Sysvar Rent".into(), None))
+    })
 }
 
 /// Decode an EpochSchedule sysvar account.
@@ -345,7 +358,7 @@ fn decode_bpf_upgradeable(
     if account.owner != bpf_loader_upgradeable::id() {
         return Ok(None);
     }
-    let state = match bincode::deserialize::<UpgradeableLoaderState>(account.data.as_slice()) {
+    let state = match wincode::deserialize::<UpgradeableLoaderState>(account.data.as_slice()) {
         Ok(s) => s,
         Err(_) => return Ok(None),
     };
@@ -474,7 +487,7 @@ fn format_timestamp_with_utc(ts: i64) -> String {
 fn build_programdata_json(account: &solana_account::Account) -> Result<Value> {
     const PROGRAM_DATA_HEADER_SIZE: usize = 45;
 
-    let state: UpgradeableLoaderState = bincode::deserialize(account.data.as_slice())
+    let state: UpgradeableLoaderState = wincode::deserialize(account.data.as_slice())
         .with_context(|| "Failed to deserialize ProgramData account")?;
 
     if let UpgradeableLoaderState::ProgramData { slot, upgrade_authority_address } = state {
@@ -595,6 +608,23 @@ mod tests {
     use spl_token::solana_program::pubkey::Pubkey as ProgramPubkey;
     use spl_token::state::{Account as TokenAccount, AccountState, Mint as LegacyMint};
     use spl_token_2022::state::Mint as Token2022Mint;
+
+    /// The rent sysvar layout: `lamports_per_byte` (u64), the eight bytes that
+    /// used to be `exemption_threshold` (f64), and `burn_percent` (u8).
+    #[test]
+    fn rent_sysvar_decodes_to_the_published_json_shape() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&5_080u64.to_le_bytes());
+        data.extend_from_slice(&2.0f64.to_le_bytes());
+        data.push(50);
+        let rent = bincode::deserialize::<solana_rent::Rent>(&data).expect("rent sysvar decodes");
+
+        let json = super::rent_sysvar_json(&rent);
+        assert_eq!(json["lamportsPerByteYear"], 5_080);
+        // Published as a number, not as the raw bytes upstream stores now.
+        assert_eq!(json["exemptionThreshold"], 2.0);
+        assert_eq!(json["burnPercent"], 50);
+    }
 
     fn legacy_owner_pubkey() -> Pubkey {
         Pubkey::new_from_array(spl_token::ID.to_bytes())

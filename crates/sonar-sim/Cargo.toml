@@ -8,6 +8,7 @@ description = "Solana transaction simulation engine powered by LiteSVM"
 [dependencies]
 base64.workspace = true
 bincode.workspace = true
+wincode.workspace = true
 bs58.workspace = true
 log.workspace = true
 serde.workspace = true
@@ -38,8 +39,13 @@ solana-system-interface.workspace = true
 # SPL Token (funding + balance_changes + account_loader)
 spl-token.workspace = true
 spl-token-2022.workspace = true
+spl-token-2022-interface.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 solana-keypair.workspace = true
 solana-signer.workspace = true
+# `dev-context-only-utils` exposes `SanitizedTransaction::try_create` and `verify`,
+# which the signature-mirror test cross-checks against (`verify` alone is not
+# enough: constructing the sanitized transaction needs `blake3` too).
+solana-transaction = { workspace = true, features = ["dev-context-only-utils"] }

@@ -241,7 +241,7 @@ fn resolve_inputs(
             let source = transaction::TxResolveSource::Instructions;
             let parsed_tx = transaction::build_transaction_from_instructions(payer, &inputs)
                 .context("Failed to build transaction from instruction inputs")?;
-            let raw_tx_base64 = transaction::encode_transaction_to_base64(&parsed_tx.transaction)?;
+            let raw_tx_base64 = parsed_tx.to_wire_base64()?;
             let cache_key = crate::core::cache::derive_cache_key_single(
                 source.as_str(),
                 &parsed_tx.transaction,

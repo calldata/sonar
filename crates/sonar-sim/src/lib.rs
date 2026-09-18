@@ -27,6 +27,7 @@ pub(crate) mod test_utils;
 pub(crate) mod token_decode;
 pub(crate) mod transaction;
 pub(crate) mod types;
+pub mod v1;
 
 // ── Public API ──
 //
@@ -69,8 +70,15 @@ pub use executor::{BundleResult, ExecutionResult, ExecutionStatus};
 // ── Transaction parsing ──
 pub use transaction::{
     AddressLookupPlan, LookupLocation, MessageAccountPlan, ParsedTransaction,
-    RawTransactionEncoding, build_lookup_locations, parse_raw_transaction,
+    RawTransactionEncoding, TransactionFormat, build_lookup_locations, parse_raw_transaction,
+    wire_bytes,
 };
+
+// ── Transaction v1 (SIMD-0385) ──
+//
+// The [`v1`] module owns the wire format: parse, sanitize, serialize, verify
+// signatures, and convert to the native v1 message the simulation executes.
+pub use v1::{V1Config, V1Instruction, V1Transaction};
 
 // ── Account loading & fetch seams ──
 pub use account_fetcher::DEFAULT_RPC_BATCH_SIZE;

@@ -100,14 +100,19 @@ impl PipelineConfig {
     /// fundings into the executor's [`SimulationOptions`]. Token fundings are
     /// prepared earlier (in [`LoadedPipeline::prepare`]) so the prepared stage
     /// can expose them to callers before execution.
+    ///
+    /// `signature_verification` is passed in rather than read from `self`
+    /// because it can be overridden per executed transaction set: see
+    /// [`signature_verification_for`].
     fn build_sim_options(
         &self,
         state: StateMutations,
         prepared_fundings: Vec<PreparedTokenFunding>,
+        signature_verification: SignatureVerification,
     ) -> SimulationOptions {
         SimulationOptions {
             execution: ExecutionOptions {
-                signature_verification: SignatureVerification::from(self.verify_signatures),
+                signature_verification,
                 slot: self.slot,
                 timestamp: self.timestamp,
             },
@@ -119,6 +124,30 @@ impl PipelineConfig {
                 account_data_patches: state.account_data_patches,
             },
         }
+    }
+}
+
+/// Signature verification mode to use for a set of transactions about to be run.
+///
+/// A legacy signature check against a v1 signature is meaningless (different
+/// signing payload), so v1 signatures are checked at parse time instead — see
+/// [`verify_v1_signatures_if_requested`] — and the VM check is skipped for any
+/// batch containing one. Every format the VM would have covered is then verified
+/// in the same pass, by [`verify_signatures_the_vm_will_skip`].
+fn signature_verification_for(
+    config: &PipelineConfig,
+    parsed: &[&ParsedTransaction],
+) -> SignatureVerification {
+    if parsed.iter().any(|tx| tx.is_v1()) {
+        if config.verify_signatures {
+            log::warn!(
+                "Signature checks for this batch run before execution: the VM cannot verify a v1 \
+                 signature, so Sonar verifies every transaction in the batch itself"
+            );
+        }
+        SignatureVerification::Skip
+    } else {
+        SignatureVerification::from(config.verify_signatures)
     }
 }
 
@@ -161,8 +190,9 @@ fn build_runner(
     resolved: ResolvedAccounts,
     state: StateMutations,
     prepared_fundings: Vec<PreparedTokenFunding>,
+    signature_verification: SignatureVerification,
 ) -> Result<SimulationRunner> {
-    let sim_opts = config.build_sim_options(state, prepared_fundings);
+    let sim_opts = config.build_sim_options(state, prepared_fundings, signature_verification);
     let prepared = PreparedSimulation::prepare(resolved, sim_opts)?;
     Ok(prepared.into_runner())
 }
@@ -261,6 +291,7 @@ impl Pipeline {
     /// Parse a single raw transaction (base64 or base58 encoded).
     pub fn parse(self, raw_tx: &str) -> Result<ParsedPipeline> {
         let parsed = parse_raw_transaction(raw_tx)?;
+        verify_v1_signatures_if_requested(&parsed, self.config.verify_signatures)?;
         Ok(ParsedPipeline { config: self.config, parsed, state: StateMutations::default() })
     }
 
@@ -268,10 +299,53 @@ impl Pipeline {
     pub fn parse_bundle(self, raw_txs: &[&str]) -> Result<ParsedBundlePipeline> {
         let mut parsed = Vec::with_capacity(raw_txs.len());
         for raw in raw_txs {
-            parsed.push(parse_raw_transaction(raw)?);
+            let parsed_tx = parse_raw_transaction(raw)?;
+            verify_v1_signatures_if_requested(&parsed_tx, self.config.verify_signatures)?;
+            parsed.push(parsed_tx);
         }
+        // Only knowable once the whole batch is parsed.
+        verify_signatures_the_vm_will_skip(&parsed, self.config.verify_signatures)?;
         Ok(ParsedBundlePipeline { config: self.config, parsed, state: StateMutations::default() })
     }
+}
+
+/// Keep the v1 view consistent with a mutated transaction.
+///
+/// See [`V1Transaction::rebuild_from_executable`]; mutations are applied to the
+/// message, so the v1 form (used for wire bytes, size, and header config) has to
+/// be re-derived. No-op for legacy/v0 transactions.
+fn rebuild_v1_view(parsed: &mut ParsedTransaction) -> Result<()> {
+    let Some(v1) = parsed.v1.as_ref() else {
+        return Ok(());
+    };
+    parsed.v1 = Some(v1.rebuild_from_executable(&parsed.transaction)?);
+    Ok(())
+}
+
+/// Check v1 signatures here rather than in the VM.
+///
+/// A v1 transaction signs its own payload, which is not the payload the VM
+/// verifies, so the VM's signature check can neither confirm nor refute a v1
+/// signature. Verifying against the real v1 payload at
+/// parse time is therefore both the only correct place to do it and the point at
+/// which the transaction is still exactly as received (mutations would make any
+/// signature stale for every format).
+fn verify_v1_signatures_if_requested(parsed: &ParsedTransaction, verify: bool) -> Result<()> {
+    // `ParsedTransaction::verify_signatures` fails closed when a v1 transaction
+    // carries no v1 view, so this cannot silently pass an unverified transaction.
+    if verify && parsed.is_v1() { parsed.verify_signatures() } else { Ok(()) }
+}
+
+/// Verify the signatures the VM will skip because a batch mixes formats.
+///
+/// [`signature_verification_for`] turns the VM check off for the whole batch as
+/// soon as one transaction is v1, which would otherwise leave the legacy/v0
+/// signatures of that batch unchecked while `--check-sig` was requested.
+fn verify_signatures_the_vm_will_skip(parsed: &[ParsedTransaction], verify: bool) -> Result<()> {
+    if !verify || !parsed.iter().any(ParsedTransaction::is_v1) {
+        return Ok(());
+    }
+    parsed.iter().filter(|tx| !tx.is_v1()).try_for_each(ParsedTransaction::verify_signatures)
 }
 
 // ── Stage 1: parsed (single) ──
@@ -301,6 +375,7 @@ impl ParsedPipeline {
     pub fn with_mutations(mut self, mutations: Mutations) -> Result<Self> {
         if !mutations.transaction.is_empty() {
             apply_tx_mutations(&mut self.parsed.transaction, &mutations)?;
+            rebuild_v1_view(&mut self.parsed)?;
             // The instruction list changed; recompute the now-stale account plan.
             self.parsed.account_plan =
                 MessageAccountPlan::from_transaction(&self.parsed.transaction);
@@ -336,6 +411,12 @@ pub struct ParsedBundlePipeline {
 }
 
 impl ParsedBundlePipeline {
+    /// Access the parsed transactions with mutations applied and account plans
+    /// recomputed.
+    pub fn parsed(&self) -> &[ParsedTransaction] {
+        &self.parsed
+    }
+
     /// Apply mutations to every transaction in the bundle. See
     /// [`ParsedPipeline::with_mutations`]; transaction-level ops apply (fail-fast)
     /// to each transaction before loading, state-level mutations are retained.
@@ -343,6 +424,10 @@ impl ParsedBundlePipeline {
         if !mutations.transaction.is_empty() {
             for tx in &mut self.parsed {
                 apply_tx_mutations(&mut tx.transaction, &mutations)?;
+                // Mutations change the message, and the v1 view has to keep agreeing
+                // with it: the report derives the instruction list from the message
+                // but the size and config block from the view.
+                rebuild_v1_view(tx)?;
                 tx.account_plan = MessageAccountPlan::from_transaction(&tx.transaction);
             }
         }
@@ -467,8 +552,14 @@ impl PreparedPipeline {
     /// with pre/post account snapshots — for callers that render or inspect the
     /// resulting state directly rather than the summarized [`SimulationResult`].
     pub fn execute_to_result(self) -> Result<ExecutionResult> {
-        let mut runner =
-            build_runner(&self.config, self.resolved, self.state, self.prepared_fundings)?;
+        let signature_verification = signature_verification_for(&self.config, &[&self.parsed]);
+        let mut runner = build_runner(
+            &self.config,
+            self.resolved,
+            self.state,
+            self.prepared_fundings,
+            signature_verification,
+        )?;
         runner.execute(&self.parsed.transaction)
     }
 }
@@ -579,8 +670,15 @@ impl PreparedBundlePipeline {
     pub fn execute_bundle_to_results(self) -> Result<BundleResult<Result<ExecutionResult>>> {
         let tx_refs: Vec<&VersionedTransaction> =
             self.parsed.iter().map(|t| &t.transaction).collect();
-        let mut runner =
-            build_runner(&self.config, self.resolved, self.state, self.prepared_fundings)?;
+        let parsed_refs: Vec<&ParsedTransaction> = self.parsed.iter().collect();
+        let signature_verification = signature_verification_for(&self.config, &parsed_refs);
+        let mut runner = build_runner(
+            &self.config,
+            self.resolved,
+            self.state,
+            self.prepared_fundings,
+            signature_verification,
+        )?;
         Ok(runner.execute_bundle(&tx_refs))
     }
 }
@@ -693,7 +791,7 @@ mod tests {
     /// A fake provider that returns a funded system-owned account for every key
     /// in the parsed transaction, so the SVM has the state a simple transfer
     /// needs. Built from the parsed account plan rather than hardcoded pubkeys.
-    fn funded_provider_for(
+    pub(super) fn funded_provider_for(
         parsed: &ParsedTransaction,
     ) -> Arc<crate::rpc_provider::FakeAccountProvider> {
         use std::collections::HashMap;
@@ -814,5 +912,260 @@ mod tests {
             load_keys,
             after
         );
+    }
+}
+
+#[cfg(test)]
+mod v1_pipeline_tests {
+    use super::*;
+    use crate::executor::ExecutionStatus;
+    use crate::pipeline::tests::funded_provider_for;
+    use crate::types::InstructionDataPatch;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use solana_account::ReadableAccount;
+
+    /// One-signature v1 transaction from the reference implementation (system
+    /// transfer of 1_000_000 lamports, 5_000-lamport priority fee).
+    fn v1_transfer_tx() -> &'static str {
+        // The reference-implementation fixture, shared by every crate that
+        // exercises the v1 wire format (the file keeps a trailing newline).
+        include_str!("../tests/fixtures/v1_transfer.b64").trim()
+    }
+
+    /// The same transaction with the last byte of its signature array flipped,
+    /// derived rather than copied so the two fixtures cannot drift apart.
+    fn v1_tampered_tx() -> String {
+        let mut bytes = BASE64_STANDARD.decode(v1_transfer_tx()).expect("fixture is base64");
+        let last = bytes.last_mut().expect("fixture is not empty");
+        *last ^= 0x0f;
+        BASE64_STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn parse_retains_v1_config_and_format() {
+        let pipeline =
+            Pipeline::new("http://localhost:8899".into()).parse(v1_transfer_tx()).unwrap();
+        let parsed = pipeline.parsed();
+        assert_eq!(parsed.format, crate::TransactionFormat::V1);
+        assert_eq!(parsed.v1.as_ref().unwrap().config.compute_unit_limit, Some(200_000));
+    }
+
+    #[test]
+    fn signature_check_passes_for_a_correctly_signed_v1_transaction() {
+        let pipeline = Pipeline::new("http://localhost:8899".into())
+            .verify_signatures(true)
+            .parse(v1_transfer_tx())
+            .expect("correctly signed v1 transaction");
+        assert!(pipeline.parsed().is_v1());
+    }
+
+    /// A signed legacy transfer, for the mixed-format batch tests, serialized with
+    /// `wincode` (the wire serializer for every format) so it can be parsed back.
+    fn signed_legacy_transfer() -> (String, Pubkey) {
+        use base64::Engine as _;
+        use solana_keypair::Keypair;
+        use solana_message::Message;
+        use solana_signer::Signer;
+        use solana_transaction::Transaction;
+
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let instruction =
+            solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient, 1_000);
+        let message = Message::new(&[instruction], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], message, solana_hash::Hash::new_unique());
+        let bytes = wincode::serialize(&VersionedTransaction::from(tx)).expect("serialize tx");
+        (BASE64_STANDARD.encode(bytes), payer.pubkey())
+    }
+
+    #[test]
+    fn bundle_mutations_keep_the_v1_view_consistent() {
+        // A bundle reaches `with_mutations` through `parse_bundle`, a different path
+        // than the single-transaction one, and both have to rebuild the view.
+        let (legacy, _) = signed_legacy_transfer();
+        let insert_ix = solana_instruction::Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: Vec::new(),
+            data: vec![1, 2, 3, 4],
+        };
+        let mutations = Mutations::builder()
+            .add_instruction_op(crate::types::InstructionOp::Insert {
+                position: 0,
+                instruction: insert_ix,
+            })
+            .build();
+
+        let pipeline = Pipeline::new("http://localhost:8899".into())
+            .parse_bundle(&[v1_transfer_tx(), &legacy])
+            .unwrap()
+            .with_mutations(mutations)
+            .unwrap();
+
+        let parsed = &pipeline.parsed()[0];
+        let v1 = parsed.v1.as_ref().expect("v1 view is retained");
+        assert_eq!(v1.instructions.len(), 2, "the insert is in the view");
+        assert_eq!(
+            v1.instructions[1].data,
+            parsed.transaction.message.instructions()[1].data,
+            "v1 view must agree with the executed message"
+        );
+        // The insert grew the transaction, so a stale view would report the old size.
+        let executed = v1.rebuild_from_executable(&parsed.transaction).unwrap();
+        assert_eq!(v1.serialize(), executed.serialize(), "size and layout are current");
+        // 240 for the original, plus 4 for the instruction header, 4 for its data
+        // and 32 for the address the inserted program adds to the address table.
+        assert_eq!(v1.serialize().len(), 240 + 4 + 4 + 32);
+        // The report sizes the transaction from the wire bytes, so a view that was
+        // not rebuilt would report the pre-mutation size here.
+        assert_eq!(parsed.to_wire_bytes().unwrap().len(), v1.serialize().len());
+    }
+
+    #[test]
+    fn mixed_batch_verifies_the_signatures_the_vm_will_skip() {
+        // The VM check is off for any batch containing v1, so the legacy half is
+        // verified before execution instead — `--check-sig` must mean all of them.
+        let (legacy, _) = signed_legacy_transfer();
+        Pipeline::new("http://localhost:8899".into())
+            .verify_signatures(true)
+            .parse_bundle(&[v1_transfer_tx(), &legacy])
+            .expect("both transactions are correctly signed");
+    }
+
+    #[test]
+    fn mixed_batch_rejects_a_tampered_legacy_signature() {
+        let (legacy, payer) = signed_legacy_transfer();
+        let mut bytes = BASE64_STANDARD.decode(&legacy).expect("fixture is base64");
+        // Byte 0 is the signature count, so the first signature starts at byte 1.
+        bytes[1] ^= 0x0f;
+        let tampered = BASE64_STANDARD.encode(bytes);
+
+        let err = match Pipeline::new("http://localhost:8899".into())
+            .verify_signatures(true)
+            .parse_bundle(&[v1_transfer_tx(), &tampered])
+        {
+            Ok(_) => panic!("tampered legacy signature must be rejected"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("legacy transaction signature 0 is invalid"), "{message}");
+        assert!(message.contains(&payer.to_string()), "{message}");
+    }
+
+    #[test]
+    fn mixed_batch_leaves_signatures_alone_without_the_flag() {
+        let (legacy, _) = signed_legacy_transfer();
+        let mut bytes = BASE64_STANDARD.decode(&legacy).expect("fixture is base64");
+        bytes[1] ^= 0x0f;
+        let tampered = BASE64_STANDARD.encode(bytes);
+
+        // Verification stays opt-in: the VM check being off must not turn parsing
+        // into a signature check of its own.
+        Pipeline::new("http://localhost:8899".into())
+            .parse_bundle(&[v1_transfer_tx(), &tampered])
+            .expect("verification is off by default");
+    }
+
+    /// A v1 transaction without a v1 view has no known signing payload, so the
+    /// verification request must fail rather than report an unchecked success.
+    #[test]
+    fn v1_format_without_a_v1_view_fails_closed() {
+        let parsed = crate::parse_raw_transaction(v1_transfer_tx()).expect("v1 fixture parses");
+        let broken = ParsedTransaction { v1: None, ..parsed };
+
+        let err = broken.verify_signatures().expect_err("no v1 view means no payload");
+        assert!(err.to_string().contains("no v1 view"), "{err}");
+    }
+
+    #[test]
+    fn signature_check_rejects_a_tampered_v1_transaction() {
+        let err = match Pipeline::new("http://localhost:8899".into())
+            .verify_signatures(true)
+            .parse(&v1_tampered_tx())
+        {
+            Ok(_) => panic!("tampered signature must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("signature 0 is invalid"), "{err}");
+    }
+
+    #[test]
+    fn signature_check_is_opt_in_for_v1() {
+        // The VM-level check is skipped for v1, so an opted-out run
+        // must still parse a tampered transaction (matching legacy behavior,
+        // where `--check-sig` is what turns verification on).
+        Pipeline::new("http://localhost:8899".into())
+            .parse(&v1_tampered_tx())
+            .expect("verification is off by default");
+    }
+
+    /// v1 header config is not decoration: the backend reads it off the native
+    /// v1 message, so the priority fee is charged and the compute unit limit is
+    /// enforced. The payer's balance change is the assertion that pins both.
+    #[test]
+    fn executes_with_the_header_config() {
+        const TRANSFER_LAMPORTS: u64 = 1_000_000;
+        // One signature (5_000 lamports base) plus the 5_000-lamport priority
+        // fee requested in the header.
+        const EXPECTED_FEE: u64 = 10_000;
+
+        let parsed = Pipeline::new("http://localhost:8899".into()).parse(v1_transfer_tx()).unwrap();
+        let payer = parsed.parsed().account_plan.static_accounts[0];
+        let recipient = parsed.parsed().account_plan.static_accounts[1];
+        let provider = funded_provider_for(parsed.parsed());
+
+        let result = Pipeline::with_provider(provider)
+            .parse(v1_transfer_tx())
+            .unwrap()
+            .load_accounts()
+            .unwrap()
+            .prepare()
+            .unwrap()
+            .execute_to_result()
+            .unwrap();
+
+        assert!(matches!(result.status, ExecutionStatus::Succeeded), "{:?}", result.status);
+        assert_eq!(result.meta.compute_units_consumed, 150);
+
+        let spent =
+            result.pre_accounts[&payer].lamports() - result.post_accounts[&payer].lamports();
+        assert_eq!(
+            spent,
+            TRANSFER_LAMPORTS + EXPECTED_FEE,
+            "payer must lose the transfer plus the base fee and the header priority fee"
+        );
+        let received = result.post_accounts[&recipient].lamports()
+            - result.pre_accounts[&recipient].lamports();
+        assert_eq!(received, TRANSFER_LAMPORTS);
+    }
+
+    #[test]
+    fn mutations_keep_the_v1_view_consistent() {
+        let mutations = Mutations::builder()
+            .patch_ix_data(InstructionDataPatch {
+                instruction_index: 0,
+                offset: 4,
+                data: 7u64.to_le_bytes().to_vec(),
+            })
+            .build();
+
+        let pipeline = Pipeline::new("http://localhost:8899".into())
+            .parse(v1_transfer_tx())
+            .unwrap()
+            .with_mutations(mutations)
+            .unwrap();
+
+        let parsed = pipeline.parsed();
+        let v1 = parsed.v1.as_ref().expect("v1 view is retained");
+        // The patch is reflected in the v1 view, not just in the message.
+        assert_eq!(&v1.instructions[0].data[4..12], &7u64.to_le_bytes());
+        assert_eq!(
+            v1.instructions[0].data,
+            parsed.transaction.message.instructions()[0].data,
+            "v1 view must agree with the executed message"
+        );
+        // Case the patch does not change: config requests survive mutation.
+        assert_eq!(v1.config.priority_fee, Some(5_000));
+        assert_eq!(v1.serialize().len(), 240);
     }
 }

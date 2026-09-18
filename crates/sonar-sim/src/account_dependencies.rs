@@ -17,7 +17,7 @@ pub(crate) fn collect_bpf_upgradeable_programdata_dependencies(
             continue;
         }
         if let Ok(UpgradeableLoaderState::Program { programdata_address }) =
-            bincode::deserialize::<UpgradeableLoaderState>(account.data())
+            wincode::deserialize::<UpgradeableLoaderState>(account.data())
         {
             let key = Pubkey::new_from_array(programdata_address.to_bytes());
             if !accounts.contains_key(&key) {
@@ -57,7 +57,7 @@ mod tests {
 
     fn make_bpf_program(programdata_address: &Pubkey) -> AccountSharedData {
         let state = UpgradeableLoaderState::Program { programdata_address: *programdata_address };
-        let data = bincode::serialize(&state).unwrap();
+        let data = wincode::serialize(&state).unwrap();
         AccountSharedData::from(Account {
             lamports: 1,
             data,

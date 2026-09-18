@@ -25,7 +25,7 @@ pub(crate) fn handle(args: SendArgs, json: bool) -> Result<()> {
         SendTransactionConfig { skip_preflight: args.skip_preflight, ..Default::default() };
 
     let signature = client
-        .send_transaction_with_config(&parsed.transaction, config)
+        .send_transaction_with_config(&parsed.to_wire_bytes()?, config)
         .context("Failed to send transaction")?;
 
     let signature_text = signature.to_string();

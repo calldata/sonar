@@ -105,7 +105,7 @@ fn classify_upgradeable_account(
     address: Pubkey,
     account_data: &[u8],
 ) -> Result<UpgradeableAccountKind> {
-    let state: UpgradeableLoaderState = bincode::deserialize(account_data).with_context(|| {
+    let state: UpgradeableLoaderState = wincode::deserialize(account_data).with_context(|| {
         format!("Failed to deserialize upgradeable loader account state: {address}")
     })?;
 
@@ -168,7 +168,7 @@ mod tests {
         let address = Pubkey::new_unique();
         let state =
             UpgradeableLoaderState::ProgramData { slot: 1, upgrade_authority_address: None };
-        let serialized = bincode::serialize(&state).expect("serialize ProgramData state");
+        let serialized = wincode::serialize(&state).expect("serialize ProgramData state");
 
         let kind =
             classify_upgradeable_account(address, &serialized).expect("classify ProgramData");
@@ -179,7 +179,7 @@ mod tests {
     fn classify_buffer_account_state() {
         let address = Pubkey::new_unique();
         let state = UpgradeableLoaderState::Buffer { authority_address: None };
-        let serialized = bincode::serialize(&state).expect("serialize Buffer state");
+        let serialized = wincode::serialize(&state).expect("serialize Buffer state");
 
         let kind = classify_upgradeable_account(address, &serialized).expect("classify Buffer");
         assert!(matches!(kind, super::UpgradeableAccountKind::Buffer));
